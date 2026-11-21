@@ -3,7 +3,7 @@
 set -euo pipefail
 
 prefix=$(realpath "${1:?usage: bash scripts/build-a1-codecs.sh NATIVE_PREFIX OUTPUT_DIRECTORY}")
-output=$(realpath "${2:?missing output directory}")
+output=$(realpath -m "${2:?missing output directory}")
 target=x86_64-w64-mingw32
 export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
 read -r -a native_flags <<< "$("$target-pkg-config" --static --cflags --libs libavcodec libavutil)"

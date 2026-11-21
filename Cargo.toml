@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/skyber-core",
+    "crates/skyber-desktop-bridge",
+    "crates/skyber-media-kyber",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytes = "1"
+kymux = { git = "https://gitlab.com/kyber/core/kymux.git", rev = "af10dbb3ea016135c0ec8e01143179ad4bda005b", features = ["backend-quinn"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+skyber-core = { path = "crates/skyber-core" }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

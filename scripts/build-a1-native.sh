@@ -2,7 +2,7 @@
 # Run in Ubuntu WSL2. Build the pinned software-codec subset for Windows x64.
 set -euo pipefail
 
-root=$(realpath "${1:?usage: bash scripts/build-a1-native.sh BUILD_DIRECTORY}")
+root=$(realpath -m "${1:?usage: bash scripts/build-a1-native.sh BUILD_DIRECTORY}")
 target=x86_64-w64-mingw32
 prefix="$root/prefix"
 jobs=${SKYBER_BUILD_JOBS:-$(nproc)}
@@ -55,20 +55,24 @@ if [[ ! -f "$root/sources/FFmpeg-n8.1/.skyber-windows-patches" ]]; then
 fi
 
 mkdir -p "$root/opus" "$root/x264" "$root/ffmpeg" "$root/avconv"
-if [[ ! -f "$prefix/lib/libopus.a" ]]; then (
-    cd "$root/opus"
-    "$root/sources/opus-1.6.1/configure" --host="$target" --prefix="$prefix" \
-        --disable-shared --enable-static --disable-doc --disable-extra-programs
-    make -j "$jobs"
-    make install
-); fi
-if [[ ! -f "$prefix/lib/libx264.a" ]]; then (
-    cd "$root/x264"
-    "$root/sources/x264/configure" --host="$target" --cross-prefix="$target-" \
-        --prefix="$prefix" --enable-static --disable-cli --disable-opencl
-    make -j "$jobs"
-    make install
-); fi
+if [[ ! -f "$prefix/lib/libopus.a" ]]; then
+    (
+        cd "$root/opus"
+        "$root/sources/opus-1.6.1/configure" --host="$target" --prefix="$prefix" \
+            --disable-shared --enable-static --disable-doc --disable-extra-programs
+        make -j "$jobs"
+        make install
+    )
+fi
+if [[ ! -f "$prefix/lib/libx264.a" ]]; then
+    (
+        cd "$root/x264"
+        "$root/sources/x264/configure" --host="$target" --cross-prefix="$target-" \
+            --prefix="$prefix" --enable-static --disable-cli --disable-opencl
+        make -j "$jobs"
+        make install
+    )
+fi
 (
     cd "$root/ffmpeg"
     export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
