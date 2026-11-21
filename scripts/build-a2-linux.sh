@@ -51,6 +51,7 @@ target=x86_64-unknown-linux-gnu
 cargo build --locked --release --target "$target" -p skyber-media-kyber --features a1-native
 install -m 755 "$CARGO_TARGET_DIR/$target/release/skyber-a1-peer" "$output/"
 install -m 755 scripts/ubuntu-capture.py "$output/skyber-ubuntu-capture"
+install -m 755 scripts/ubuntu-playback.py "$output/skyber-ubuntu-playback"
 (
     git rev-parse HEAD
     rustc -Vv

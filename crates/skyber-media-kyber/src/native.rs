@@ -61,6 +61,15 @@ unsafe extern "C" {
         key: *mut u32,
     ) -> i32;
     fn a1_decode(codec: *mut c_void, data: *const u8, size: u32, out: *mut Decoded) -> i32;
+    fn skyber_decode_output(
+        codec: *mut c_void,
+        data: *const u8,
+        size: u32,
+        out: *mut Decoded,
+        frames: *mut u8,
+        capacity: u32,
+        written: *mut u32,
+    ) -> i32;
     fn a1_codec_close(codec: *mut c_void);
 }
 
@@ -209,6 +218,36 @@ impl Decoder {
         Ok(Self(Context::from_open(code, pointer)?))
     }
 
+    /// Decode PCM or tightly packed I420 into a reusable, bounded destination.
+    pub fn decode_output<'a>(
+        &mut self,
+        data: &[u8],
+        frames: &'a mut [u8],
+    ) -> Result<(Decoded, &'a [u8])> {
+        if data.len() > MAX_PACKET || frames.len() > MAX_PACKET {
+            return Err(CodecError::Oversize);
+        }
+        let mut output = Decoded::default();
+        let mut written = 0;
+        // SAFETY: The decoder is exclusively owned. The input and output slices hold
+        // the declared lengths and the native shim does not retain their pointers.
+        check(unsafe {
+            skyber_decode_output(
+                self.0.0.as_ptr(),
+                data.as_ptr(),
+                data.len() as u32,
+                &mut output,
+                frames.as_mut_ptr(),
+                frames.len() as u32,
+                &mut written,
+            )
+        })?;
+        let bytes = frames
+            .get(..written as usize)
+            .ok_or(CodecError::InvalidResult)?;
+        Ok((output, bytes))
+    }
+
     pub fn decode(&mut self, data: &[u8]) -> Result<Decoded> {
         if data.len() > MAX_PACKET {
             return Err(CodecError::Oversize);
@@ -244,7 +283,10 @@ mod tests {
         for level in [32, 224] {
             pixels[..320 * 180].fill(level);
             let (packet, _) = encoder.encode_capture(CaptureFrame::I420(&pixels))?;
-            let decoded = decoder.decode(packet)?;
+            let mut decoded_pixels = [0; I420_BYTES];
+            let (decoded, bytes) = decoder.decode_output(packet, &mut decoded_pixels)?;
+            assert_eq!(bytes.len(), I420_BYTES);
+            assert!(bytes[0].abs_diff(level) <= 2);
             assert_eq!(decoded.frames, 1);
             fingerprints.push(decoded.fingerprint);
         }
@@ -274,7 +316,10 @@ mod tests {
             }
             let (packet, _) = encoder.encode_capture(CaptureFrame::PcmF32(&samples))?;
             if !packet.is_empty() {
-                let decoded = decoder.decode(packet)?;
+                let mut pcm = [0; 960 * 4];
+                let (decoded, bytes) = decoder.decode_output(packet, &mut pcm)?;
+                assert_eq!(bytes.len(), decoded.samples as usize * 4);
+                assert!(bytes.iter().any(|byte| *byte != 0));
                 decoded_samples += decoded.samples;
                 crossings += decoded.crossings;
             }
