@@ -308,6 +308,23 @@ def run_case(
                 expected = row["samples"] * 4 if track == "microphone" else row["decoded_frames"] * 86400
                 require(row.get("playback_bytes") == expected and expected > 0,
                         f"{track} playback did not receive every decoded frame")
+                if track in ("camera", "screen"):
+                    events = row.get("presentation_events", [])
+                    require(bool(events), f"{track} has no native presentation events")
+                    packet_ids = {sample["packet_id_us"] for sample in row["timings"]}
+                    require(all(event["packet_id_us"] in packet_ids
+                                and event["helper_clock_domain"] == "playback_helper_monotonic_us_since_start"
+                                for event in events),
+                            f"{track} presentation event does not match a decoded packet")
+                    require(all(left["helper_timestamp_us"] < right["helper_timestamp_us"]
+                                for left, right in zip(events, events[1:])),
+                            f"{track} presentation clock is not increasing")
+                    summary = row.get("presentation_summary", {})
+                    require(summary.get("presented_frames") == len(events)
+                            and summary.get("clock_domain") == "playback_helper_monotonic_us_since_start"
+                            and summary.get("inter_event_interval_us", {}).get("samples")
+                                == max(0, len(events) - 1),
+                            f"{track} presentation summary is incomplete")
             for track in ("camera", "screen"):
                 if profile == "av_with_screen" or (profile == "av" and track == "camera"):
                     require(f"{track} frames" in read_stderr(output, "initiator"),

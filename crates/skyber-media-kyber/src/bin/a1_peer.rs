@@ -20,6 +20,7 @@ use tokio::{
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(4);
+const PLAYBACK_DRAIN_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_RECEIVED_PACKETS: usize = 1000;
 const AUDIO_RATE: u32 = 48_000;
 
@@ -210,6 +211,21 @@ struct PresentedPacket {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone, Serialize)]
+struct PresentationEvent {
+    packet_id_us: u64,
+    helper_timestamp_us: u64,
+    helper_clock_domain: &'static str,
+}
+
+#[derive(Default, Serialize)]
+struct PresentationSummary {
+    clock_domain: &'static str,
+    presented_frames: usize,
+    frames_per_second: Option<f64>,
+    inter_event_interval_us: Percentiles,
+}
+
 #[derive(Clone, Default, Serialize)]
 struct TimingSample {
     packet_id_us: u64,
@@ -364,6 +380,52 @@ fn timing_summary(samples: &[TimingSample]) -> TimingSummary {
             .filter_map(|sample| sample.playback_queue_depth)
             .max()
             .unwrap_or(0),
+    }
+}
+
+fn parse_video_presentation_event(line: &str) -> Result<Option<PresentationEvent>> {
+    let Some(rest) = line.strip_prefix("SKYBER_PRESENT_VIDEO ") else {
+        return Ok(None);
+    };
+    let mut fields = rest.split_ascii_whitespace();
+    let packet_id_us = fields
+        .next()
+        .context("missing presentation packet ID")?
+        .parse()?;
+    let helper_timestamp_us = fields
+        .next()
+        .context("missing presentation helper timestamp")?
+        .parse()?;
+    ensure!(
+        fields.next().is_none(),
+        "unexpected presentation event fields"
+    );
+    Ok(Some(PresentationEvent {
+        packet_id_us,
+        helper_timestamp_us,
+        helper_clock_domain: "playback_helper_monotonic_us_since_start",
+    }))
+}
+
+fn presentation_summary(events: &[PresentationEvent]) -> PresentationSummary {
+    let times: Vec<_> = events
+        .iter()
+        .map(|event| event.helper_timestamp_us)
+        .collect();
+    let intervals: Vec<_> = times
+        .windows(2)
+        .filter_map(|pair| pair[1].checked_sub(pair[0]))
+        .collect();
+    let frames_per_second = times
+        .first()
+        .zip(times.last())
+        .filter(|(first, last)| last > first)
+        .map(|(first, last)| (times.len() - 1) as f64 * 1_000_000.0 / (last - first) as f64);
+    PresentationSummary {
+        clock_domain: "playback_helper_monotonic_us_since_start",
+        presented_frames: events.len(),
+        frames_per_second,
+        inter_event_interval_us: percentiles(intervals),
     }
 }
 
@@ -599,6 +661,9 @@ struct Observed {
     first_decoded_us: u64,
     last_decoded_us: u64,
     timings: Vec<TimingSample>,
+    presentation_events: Vec<PresentationEvent>,
+    #[serde(skip_serializing_if = "presentation_summary_is_empty")]
+    presentation_summary: PresentationSummary,
     timing_summary: TimingSummary,
     decoded_frames_per_second: f64,
     #[serde(skip_serializing_if = "is_zero")]
@@ -609,14 +674,21 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+fn presentation_summary_is_empty(summary: &PresentationSummary) -> bool {
+    summary.presented_frames == 0
+}
+
 async fn present(
     track: Track,
     mut rx: mpsc::Receiver<PresentedPacket>,
     audio_output: Option<DeviceSelector>,
     origin: Instant,
-) -> Result<(usize, Vec<TimingSample>)> {
+) -> Result<(usize, Vec<TimingSample>, Vec<PresentationEvent>)> {
     use std::process::Stdio;
-    use tokio::{io::AsyncWriteExt, process::Command};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        process::Command,
+    };
 
     let name = if cfg!(windows) {
         "skyber-windows-playback.exe"
@@ -639,10 +711,27 @@ async fn present(
     }
     let mut child = command
         .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("start platform playback helper")?;
     let mut stdin = child.stdin.take().context("missing playback pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("missing playback helper log pipe")?;
+    let event_reader = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut events = Vec::new();
+        while let Some(line) = lines.next_line().await? {
+            if let Some(event) = parse_video_presentation_event(&line)? {
+                events.push(event);
+            } else {
+                eprintln!("{line}");
+            }
+        }
+        Ok::<_, anyhow::Error>(events)
+    });
     let mut delivered = 0;
     let mut dismissed = false;
     let mut timings = Vec::new();
@@ -653,7 +742,29 @@ async fn present(
                 playback_submit_start_us: Some(elapsed_micros(origin)?),
                 ..TimingSample::default()
             };
-            match stdin.write_all(&packet.bytes).await {
+            let write_result = if track == Track::Microphone {
+                stdin.write_all(&packet.bytes).await
+            } else {
+                let frame_size = 320 * 180 * 3 / 2;
+                ensure!(
+                    packet.bytes.len() % frame_size == 0,
+                    "decoded video is not whole I420 frames"
+                );
+                let packet_id = packet.packet_id_us.to_le_bytes();
+                let mut result = Ok(());
+                for frame in packet.bytes.chunks_exact(frame_size) {
+                    if let Err(error) = stdin.write_all(&packet_id).await {
+                        result = Err(error);
+                        break;
+                    }
+                    if let Err(error) = stdin.write_all(frame).await {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                result
+            };
+            match write_result {
                 Ok(()) => {
                     delivered += packet.bytes.len();
                     timing.playback_submit_end_us = Some(elapsed_micros(origin)?);
@@ -677,7 +788,10 @@ async fn present(
         ensure!(child.wait().await?.success(), "playback helper failed");
     }
     ensure!(delivered > 0 || dismissed, "playback had no decoded output");
-    Ok((delivered, timings))
+    let presentation_events = event_reader
+        .await
+        .context("read presentation helper events")??;
+    Ok((delivered, timings, presentation_events))
 }
 
 fn decode_track(
@@ -812,13 +926,15 @@ async fn subscribe(
         if playback {
             present(track, output, audio_output, origin).await
         } else {
-            Ok((0, Vec::new()))
+            Ok((0, Vec::new(), Vec::new()))
         }
     };
     let decode = async { worker.await? };
-    let (_, (delivered, playback_timings), mut observed) =
+    let (_, (delivered, playback_timings, presentation_events), mut observed) =
         tokio::try_join!(receive, render, decode)?;
     observed.playback_bytes = delivered;
+    observed.presentation_events = presentation_events;
+    observed.presentation_summary = presentation_summary(&observed.presentation_events);
     let playback: std::collections::HashMap<_, _> = playback_timings
         .into_iter()
         .map(|timing| (timing.packet_id_us, timing))
@@ -915,8 +1031,13 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
         .await
         .context("Kyber track registration timed out")??;
 
+        let drain_timeout = if playback {
+            PLAYBACK_DRAIN_TIMEOUT
+        } else {
+            SETUP_TIMEOUT
+        };
         let duration =
-            Duration::from_millis(config.duration_ms + config.capture_wait_ms) + SETUP_TIMEOUT;
+            Duration::from_millis(config.duration_ms + config.capture_wait_ms) + drain_timeout;
         let origin = Instant::now();
         let result = timeout(duration, async {
             let mut tasks = JoinSet::new();
@@ -990,7 +1111,39 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod timing_tests {
-    use super::{TimingSample, packet_rate, percentiles, timing_summary};
+    use super::{
+        PresentationEvent, TimingSample, packet_rate, parse_video_presentation_event, percentiles,
+        presentation_summary, timing_summary,
+    };
+
+    #[test]
+    fn parse_correlated_video_presentation_event() {
+        let event = parse_video_presentation_event("SKYBER_PRESENT_VIDEO 123 456")
+            .expect("valid event")
+            .expect("recognized event");
+        assert_eq!(event.packet_id_us, 123);
+        assert_eq!(event.helper_timestamp_us, 456);
+        assert!(
+            parse_video_presentation_event("ordinary helper log")
+                .expect("non-event line")
+                .is_none()
+        );
+        assert!(parse_video_presentation_event("SKYBER_PRESENT_VIDEO nope 456").is_err());
+    }
+
+    #[test]
+    fn presentation_summary_uses_only_helper_local_time() {
+        let events = [100, 66_766, 133_433].map(|helper_timestamp_us| PresentationEvent {
+            packet_id_us: helper_timestamp_us,
+            helper_timestamp_us,
+            helper_clock_domain: "playback_helper_monotonic_us_since_start",
+        });
+        let summary = presentation_summary(&events);
+        assert_eq!(summary.presented_frames, 3);
+        assert!((summary.frames_per_second.unwrap_or_default() - 15.0).abs() < 0.01);
+        assert_eq!(summary.inter_event_interval_us.samples, 2);
+        assert_eq!(summary.inter_event_interval_us.p50_us, Some(66_666));
+    }
 
     #[test]
     fn empty_percentiles_have_no_duration_claim() {

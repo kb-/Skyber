@@ -29,6 +29,11 @@ The current boundaries are:
 | `decode_start_us`, `decode_end_us` | Around the codec decode call. |
 | `playback_queue_depth`, `playback_enqueue_us` | Queue state and enqueue completion for decoded bytes accepted by the presentation task. |
 | `playback_submit_start_us`, `playback_submit_end_us` | Rust's write of decoded bytes to the platform helper pipe. This is not display scanout or speaker completion. |
+| `presentation_events` | For each Windows `WM_PAINT` or GTK `after-paint` event, the video helper reports the decoded packet ID and a helper-local monotonic timestamp. This is a window/compositor paint boundary, not physical display scanout. |
+
+Video results also summarize event count, helper-local presentation rate,
+and p50/p95 inter-event intervals. These describe paint cadence on that
+helper only; they are not cross-host latency values.
 
 Each capture helper prefixes every fixed-size sample with an unsigned
 little-endian 64-bit helper-relative monotonic timestamp. The peer records
@@ -38,8 +43,6 @@ sample counts. Queue depths are recorded for the capture, encode and
 playback queues. The samples contain timing values and packet IDs only,
 never media bytes. The sender's packet PTS is a correlation key; a
 receiver must not subtract it from receiver-local timestamps.
-
-## Limits and next measurements
 
 ## Wi-Fi evidence (2026-11-22)
 
@@ -64,6 +67,31 @@ The microphone run lengths differ because the live capture helpers finish
 their fixed sample/frame windows at different times. This is an initial
 instrumentation result and does not close the A2-2 gate.
 
+### Video paint event check
+
+The 12-second synthetic playback case passed on Windows and Ubuntu
+26.04.1. Every reported paint event referenced a decoded packet ID, and
+each helper-local clock increased.
+
+| Platform | Track | Decoded frames | Paint events | Paint rate | Inter-event p50/p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Windows GDI | Camera | 180 | 180 | 15.04 fps | 68,027 / 77,559 µs |
+| Windows GDI | Screen | 105 | 105 | 15.05 fps | 68,299 / 77,653 µs |
+| Ubuntu GTK | Camera | 180 | 163 | 15.10 fps | 67,107 / 71,275 µs |
+| Ubuntu GTK | Screen | 105 | 86 | 15.20 fps | 67,179 / 69,328 µs |
+
+The GTK viewer uses a latest-frame slot, so superseded frames can be
+decoded without being painted. These events end at the native
+window/compositor paint boundary, not display scanout. Structured Windows
+and Ubuntu results are under `target/a2-2/presentation-windows-timeoutfix/`
+and `target/a2-2/ubuntu-presentation-timeoutfix.stdout`.
+
+One full Windows playback run exceeded the peer's original four-second
+post-media shutdown margin. The identical-duration direct run and one
+complete wrapper retry passed. The playback test peer now allows a
+12-second drain margin for output helpers; it still times out if the
+helpers or tracks fail to terminate within that bound.
+
 ### Helper timestamp protocol check
 
 On the same Windows host and Ubuntu 26.04.1 guest, the updated Windows
@@ -76,14 +104,16 @@ Logitech C922 reported 219 microphone packets and 71 camera frames. Media
 payloads remained in memory. This checks the new local binary pipe framing;
 it is not a hardware sensor timestamp or an end-to-end LAN latency sample.
 
-These measurements describe application boundaries. They do not
-measure camera exposure, transport one-way latency, visible display
-presentation, acoustic output, or glass-to-glass delay. In particular,
-the playback submission boundary ends at the helper pipe. The existing
-native helpers report completed audio output and rendered video counts,
-but do not yet report per-packet device presentation timestamps.
+## Limits and next measurements
 
-The remaining A2-2 work is to add native audio/video presentation events,
+These measurements describe application boundaries. They do not
+measure camera exposure, transport one-way latency, physical display
+scanout, acoustic output completion, or glass-to-glass delay. In
+particular, the audio playback submission boundary ends at the helper
+pipe. Video presentation events report a correlated window/compositor
+paint, not a per-packet display device timestamp.
+
+The remaining A2-2 work is to add native audio output completion events,
 expose supported Kyber RTT and loss data, and collect CPU, memory,
 frame-rate and drop measurements. Glass-to-glass video and audio delay
 require an external reference such as a high-speed camera and
