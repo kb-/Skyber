@@ -214,3 +214,13 @@ All recommendations are provisional until Gates A–C. Do not represent proposed
 - Windows platform support: https://docs.kyber.tech/docs/GettingStarted/Kyber-installation-notes-windows/
 - Linux platform installation: https://docs.kyber.tech/docs/GettingStarted/Kyber-installation-notes-linux/
 - Qt 6 Windows supported configurations: https://doc.qt.io/qt-6/windows.html
+
+## 11. Engineering practices and agent guidance
+
+The implementation shall follow:
+- [Code quality and toolchain policy](QUALITY.md) — Rust/QML linting, dependency/license controls, CI tiers, code coverage, PR requirements.
+- [Testing strategy](TESTING.md) — deterministic local A1 versus physical Windows 11–Linux A2 and specialized multimedia tests.
+- [Coding style](CODING_STYLE.md) — Rust, Qt Quick/QML, C++ FFI, threading, security, and performance conventions.
+- [AGENT.md](../AGENT.md) and [AGENTS.md](../AGENTS.md) — detailed coding-agent instructions and auto-discovery entry point.
+
+These documents are **proposed policy**, not claims that the associated build files, binaries or CI checks have been implemented.
