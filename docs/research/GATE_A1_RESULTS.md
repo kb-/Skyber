@@ -21,9 +21,13 @@ QUIC connection, a pinned test certificate, and authenticated track exchange.
 
 The concurrent run used H.264 at 320×180, 15 fps, and stereo Opus at 48 kHz in
 20 ms blocks. Its six received tracks measured p50 0.515–0.570 ms and p95
-0.734–0.921 ms from the software source call through the receiver reading the
-decoded frame or PCM samples. This is same-host software timing with no physical
-capture or presentation. Windows reported 31.25 ms of process CPU time per peer
+0.734–0.921 ms from just before the sender calls `Encoder::next_packet()` to
+just after the receiver decodes the packet. The timed encoder call generates
+synthetic samples or pixels and runs the software encoder. The timestamp is
+attached to the packet returned by that call. Encoder buffering can make that
+packet represent earlier input, so the metric does not establish per-frame
+source-to-decode latency. It also excludes physical capture and presentation.
+Windows reported 31.25 ms of process CPU time per peer
 for the concurrent run. The software profile used no GPU codec.
 
 The decoder captured PCM in memory. The Opus logs reported the initial skip and
