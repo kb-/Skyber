@@ -70,4 +70,31 @@ each physical PC.
 Test screenshots and process logs stayed under `target/a2-1c`. The
 Windows A1 matrix and MSVC codec ABI probe passed. The native codec
 tests verified packed I420 and PCM output. These observations establish
-decoded output and per-track viewer lifetime. A cross-host call using live sources with playback enabled remains pending.
+decoded output and per-track viewer lifetime.
+
+## Cross-host live verification on November 21, 2026
+
+The Windows 11 PC (`192.168.1.30`) and Ubuntu 26.04.1 LTS VirtualBox
+guest (`192.168.1.36`) exchanged live media over Wi-Fi. Ubuntu initiated
+each authenticated Kyber connection and Windows listened. Both capture
+directions delivered live microphone and camera packets, and the
+receiving platform reported the matching decoded playback bytes.
+
+| Call | Live source and decoded output |
+| --- | --- |
+| Windows to Ubuntu | 291 microphone packets and 59 camera packets sent and received. Ubuntu decoded and passed 1,116,192 audio bytes and 5,097,600 camera bytes to playback. |
+| Ubuntu to Windows | Logitech C922 and microphone sent 293 microphone packets and 92 camera packets. Windows received and decoded every packet, with 1,123,872 audio bytes and 7,948,800 camera bytes passed to its playback helpers. |
+| Windows screen to Ubuntu | The operator selected the disposable `SKYBER TEST` window. All 58 screen, 515 microphone, and 118 camera packets arrived and decoded. Ubuntu presented 58 screen updates. Camera and microphone overlapped the screen for 3.18 seconds, then continued for 6.44 and 6.32 seconds after its last frame. |
+
+The Windows screen helper was configured to reject any selected title
+other than `SKYBER TEST`. No camera, microphone, or screen payload was
+written to the result directory. The structured results are under
+`target/a2-1c/live/20261121T221703.082189Z`.
+
+In this bridged Wi-Fi topology, a separate Windows-originated UDP
+datagram to a temporary Ubuntu listener was not observed within 12
+seconds. Ubuntu's UFW service was inactive. The tested calls therefore
+used Ubuntu as the QUIC connection initiator while media flowed in both
+directions. This probe does not establish the cause; determine whether
+host-initiated sessions are required when validating bare-metal Linux
+or a different Wi-Fi bridge before treating this as a platform limit.
