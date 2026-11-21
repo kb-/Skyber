@@ -84,3 +84,24 @@ Physical webcam plus screen capture, local playback, AEC, GPU texture sharing,
 and LAN measurements require later evidence. The upstream packet readers are
 also subject to separate allocation and malformed-input review before use
 with remote peers. The A1 prototype only accepts authenticated local traffic.
+
+## Native build and Windows ABI results
+
+Ubuntu WSL2 cross-built the software profile with MinGW-w64 GCC 13-posix,
+the target pkg-config, NASM, and GNU Make. The two SHA-256-checked archives and
+three Git component pins are listed in `scripts/build-a1-native.sh`. The build
+installs the pinned FFmpeg libraries, x264, Opus, and avconv in the selected
+build prefix. Early configure attempts found that the standalone avconv fork
+rejects the FFmpeg `--disable-network` and `--enable-libx264` flags. The working
+recipe builds patched FFmpeg first and then avconv. A VideoToolbox patch failed
+to apply with zero fuzz, so the Windows recipe selects common and Windows
+patches and excludes VideoToolbox and visionOS.
+
+The MinGW codec DLL imports `bcrypt.dll`, `KERNEL32.dll`, and `msvcrt.dll`.
+The Windows x64 MSVC probe loaded and unloaded it three times. Each invocation
+decoded 3,528 Opus samples per channel from four 960-sample input blocks. The
+difference is the Opus decoder's initial 312-sample skip. The null-output check
+and missing-export check also passed. The missing-DLL run returned status 1
+with Windows error 126. The probe verifies the narrow C ABI and caller-owned
+output. It leaves C++ objects, pointers with foreign allocator ownership, and
+native codec structs inside their respective modules.
