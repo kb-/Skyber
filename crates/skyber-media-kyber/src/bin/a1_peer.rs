@@ -1,7 +1,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -171,11 +171,8 @@ fn codec(track: Track) -> u32 {
     })
 }
 
-fn wall_micros() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_micros()
-        .try_into()?)
+fn elapsed_micros(origin: Instant) -> Result<u64> {
+    Ok(origin.elapsed().as_micros().try_into()?)
 }
 
 fn media(pts: u64, payload: Bytes, is_config: bool, is_key: bool) -> Result<types::AVPacket> {
@@ -190,22 +187,207 @@ fn media(pts: u64, payload: Bytes, is_config: bool, is_key: bool) -> Result<type
     }))
 }
 
+struct SourceFrame {
+    bytes: Vec<u8>,
+    source_ready_us: u64,
+    capture_queue_depth: usize,
+}
+
+struct EncodedPacket {
+    packet: types::AVPacket,
+    timing: Option<TimingSample>,
+}
+
+struct ReceivedPacket {
+    packet: types::MediaPacket,
+    timing: TimingSample,
+}
+
+struct PresentedPacket {
+    packet_id_us: u64,
+    playback_queue_depth: usize,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct TimingSample {
+    packet_id_us: u64,
+    source_ready_us: Option<u64>,
+    capture_queue_depth: Option<usize>,
+    encode_start_us: Option<u64>,
+    encode_end_us: Option<u64>,
+    encode_queue_depth: Option<usize>,
+    transport_send_start_us: Option<u64>,
+    transport_send_end_us: Option<u64>,
+    transport_receive_us: Option<u64>,
+    decode_start_us: Option<u64>,
+    decode_end_us: Option<u64>,
+    playback_queue_depth: Option<usize>,
+    playback_enqueue_us: Option<u64>,
+    playback_submit_start_us: Option<u64>,
+    playback_submit_end_us: Option<u64>,
+}
+
+#[derive(Default, Serialize)]
+struct Percentiles {
+    samples: usize,
+    p50_us: Option<u64>,
+    p95_us: Option<u64>,
+}
+
+#[derive(Default, Serialize)]
+struct TimingSummary {
+    clock_domain: &'static str,
+    capture_pipe_packets_per_second: Option<f64>,
+    received_packets_per_second: Option<f64>,
+    source_to_encode_us: Percentiles,
+    encode_us: Percentiles,
+    encode_to_transport_us: Percentiles,
+    transport_send_us: Percentiles,
+    receive_to_decode_us: Percentiles,
+    decode_us: Percentiles,
+    decode_to_playback_queue_us: Percentiles,
+    playback_submit_us: Percentiles,
+    capture_queue_depth_max: usize,
+    encode_queue_depth_max: usize,
+    playback_queue_depth_max: usize,
+}
+
+fn percentiles(mut samples: Vec<u64>) -> Percentiles {
+    samples.sort_unstable();
+    let percentile = |percent| {
+        samples
+            .len()
+            .checked_sub(1)
+            .and_then(|last| samples.get(last * percent / 100).copied())
+    };
+    Percentiles {
+        samples: samples.len(),
+        p50_us: percentile(50),
+        p95_us: percentile(95),
+    }
+}
+
+fn packet_rate(
+    samples: &[TimingSample],
+    timestamp: impl Fn(&TimingSample) -> Option<u64>,
+) -> Option<f64> {
+    let times: Vec<_> = samples.iter().filter_map(timestamp).collect();
+    let first = *times.first()?;
+    let last = *times.last()?;
+    let span = last.checked_sub(first)?;
+    if times.len() < 2 || span == 0 {
+        return None;
+    }
+    Some((times.len() - 1) as f64 * 1_000_000.0 / span as f64)
+}
+
+fn timing_summary(samples: &[TimingSample]) -> TimingSummary {
+    let duration = |start: Option<u64>, end: Option<u64>| {
+        start
+            .zip(end)
+            .and_then(|(start, end)| end.checked_sub(start))
+    };
+    TimingSummary {
+        clock_domain: "peer_monotonic_us_since_media_start",
+        capture_pipe_packets_per_second: packet_rate(samples, |sample| sample.source_ready_us),
+        received_packets_per_second: packet_rate(samples, |sample| sample.transport_receive_us),
+        source_to_encode_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| duration(sample.source_ready_us, sample.encode_start_us))
+                .collect(),
+        ),
+        encode_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| duration(sample.encode_start_us, sample.encode_end_us))
+                .collect(),
+        ),
+        encode_to_transport_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| duration(sample.encode_end_us, sample.transport_send_start_us))
+                .collect(),
+        ),
+        transport_send_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| {
+                    duration(sample.transport_send_start_us, sample.transport_send_end_us)
+                })
+                .collect(),
+        ),
+        receive_to_decode_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| duration(sample.transport_receive_us, sample.decode_start_us))
+                .collect(),
+        ),
+        decode_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| duration(sample.decode_start_us, sample.decode_end_us))
+                .collect(),
+        ),
+        decode_to_playback_queue_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| duration(sample.decode_end_us, sample.playback_enqueue_us))
+                .collect(),
+        ),
+        playback_submit_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| {
+                    duration(
+                        sample.playback_submit_start_us,
+                        sample.playback_submit_end_us,
+                    )
+                })
+                .collect(),
+        ),
+        capture_queue_depth_max: samples
+            .iter()
+            .filter_map(|sample| sample.capture_queue_depth)
+            .max()
+            .unwrap_or(0),
+        encode_queue_depth_max: samples
+            .iter()
+            .filter_map(|sample| sample.encode_queue_depth)
+            .max()
+            .unwrap_or(0),
+        playback_queue_depth_max: samples
+            .iter()
+            .filter_map(|sample| sample.playback_queue_depth)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
 fn encode_track(
-    tx: mpsc::Sender<types::AVPacket>,
+    tx: mpsc::Sender<EncodedPacket>,
     track: Track,
     source: u32,
     duration_ms: u64,
-    mut capture: Option<mpsc::Receiver<Vec<u8>>>,
+    mut capture: Option<mpsc::Receiver<SourceFrame>>,
+    origin: Instant,
 ) -> Result<u32> {
     let mut encoder = Encoder::new(track, source)?;
-    tx.blocking_send(types::AVPacket::Codec(types::CodecPacket {
-        header: types::CodecPacketHeader {
-            codec: codec(track),
-            rotation: 0,
-            frame_size: 0,
-        },
-    }))?;
-    tx.blocking_send(media(0, Bytes::from(encoder.config()?), true, false)?)?;
+    tx.blocking_send(EncodedPacket {
+        packet: types::AVPacket::Codec(types::CodecPacket {
+            header: types::CodecPacketHeader {
+                codec: codec(track),
+                rotation: 0,
+                frame_size: 0,
+            },
+        }),
+        timing: None,
+    })?;
+    tx.blocking_send(EncodedPacket {
+        packet: media(0, Bytes::from(encoder.config()?), true, false)?,
+        timing: None,
+    })?;
     let rate = if track == Track::Microphone { 50 } else { 15 };
     let frames = duration_ms * rate / 1000;
     let start = Instant::now();
@@ -213,10 +395,10 @@ fn encode_track(
     let mut last_pts = 0;
     for frame in 0.. {
         let captured = if let Some(capture) = &mut capture {
-            let Some(bytes) = capture.blocking_recv() else {
+            let Some(frame) = capture.blocking_recv() else {
                 break;
             };
-            Some(bytes)
+            Some(frame)
         } else {
             if frame >= frames {
                 break;
@@ -225,8 +407,12 @@ fn encode_track(
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             None
         };
-        let pts = wall_micros()?.max(last_pts + 1);
-        let (payload, key) = match captured {
+        let source_ready_us = captured
+            .as_ref()
+            .map_or_else(|| elapsed_micros(origin), |frame| Ok(frame.source_ready_us))?;
+        let pts = source_ready_us.max(last_pts + 1);
+        let encode_start_us = elapsed_micros(origin)?;
+        let (payload, key) = match captured.as_ref().map(|frame| frame.bytes.as_slice()) {
             Some(bytes) if track == Track::Microphone => {
                 let mut samples = [0.0; 1920];
                 for (sample, bytes) in samples.iter_mut().zip(bytes.chunks_exact(4)) {
@@ -235,11 +421,28 @@ fn encode_track(
                 }
                 encoder.encode_capture(CaptureFrame::PcmF32(&samples))?
             }
-            Some(bytes) => encoder.encode_capture(CaptureFrame::I420(&bytes))?,
+            Some(bytes) => encoder.encode_capture(CaptureFrame::I420(bytes))?,
             None => encoder.next_packet()?,
         };
+        let encode_end_us = elapsed_micros(origin)?;
         if !payload.is_empty() {
-            tx.blocking_send(media(pts, Bytes::copy_from_slice(payload), false, key)?)?;
+            let encode_queue_depth = tx.max_capacity().saturating_sub(tx.capacity());
+            let mut timing = TimingSample {
+                packet_id_us: pts,
+                source_ready_us: Some(source_ready_us),
+                encode_start_us: Some(encode_start_us),
+                encode_end_us: Some(encode_end_us),
+                encode_queue_depth: Some(encode_queue_depth),
+                ..TimingSample::default()
+            };
+            if let Some(frame) = &captured {
+                timing.capture_queue_depth = Some(frame.capture_queue_depth);
+            }
+            let packet = media(pts, Bytes::copy_from_slice(payload), false, key)?;
+            tx.blocking_send(EncodedPacket {
+                packet,
+                timing: Some(timing),
+            })?;
             last_pts = pts;
             count += 1;
         }
@@ -251,8 +454,9 @@ async fn capture_frames(
     track: Track,
     input: Input,
     duration_ms: u64,
-    channel: mpsc::Sender<Vec<u8>>,
+    channel: mpsc::Sender<SourceFrame>,
     ready: Option<watch::Sender<bool>>,
+    origin: Instant,
 ) -> Result<()> {
     use std::process::Stdio;
     use tokio::{io::AsyncReadExt, process::Command};
@@ -302,7 +506,12 @@ async fn capture_frames(
         if let Some(signal) = ready.take() {
             signal.send_replace(true);
         }
-        channel.send(frame).await?;
+        let queued = SourceFrame {
+            bytes: frame,
+            source_ready_us: elapsed_micros(origin)?,
+            capture_queue_depth: channel.max_capacity().saturating_sub(channel.capacity()),
+        };
+        channel.send(queued).await?;
     }
     ensure!(child.wait().await?.success(), "capture helper failed");
     Ok(())
@@ -314,18 +523,29 @@ async fn publish(
     duration_ms: u64,
     input: Input,
     screen_ready: Option<watch::Sender<bool>>,
+    origin: Instant,
 ) -> Result<Observed> {
     let mut protocol = endpoint.ready().await?;
     let (tx, mut rx) = mpsc::channel(2);
     let (raw_tx, raw_rx) = mpsc::channel(2);
     let capture = (!matches!(input, Input::Synthetic)).then_some(raw_rx);
-    let worker =
-        tokio::task::spawn_blocking(move || encode_track(tx, track, source, duration_ms, capture));
+    let worker = tokio::task::spawn_blocking(move || {
+        encode_track(tx, track, source, duration_ms, capture, origin)
+    });
     let send = async {
+        let mut timings = Vec::new();
         while let Some(packet) = rx.recv().await {
-            protocol.send(packet).await?;
+            let mut packet = packet;
+            if let Some(mut timing) = packet.timing.take() {
+                timing.transport_send_start_us = Some(elapsed_micros(origin)?);
+                protocol.send(packet.packet).await?;
+                timing.transport_send_end_us = Some(elapsed_micros(origin)?);
+                timings.push(timing);
+            } else {
+                protocol.send(packet.packet).await?;
+            }
         }
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>(timings)
     };
     let acquire = async {
         if matches!(input, Input::Synthetic) {
@@ -338,15 +558,19 @@ async fn publish(
             let signal = matches!(input, Input::ScreenPicker)
                 .then_some(screen_ready)
                 .flatten();
-            capture_frames(track, input, duration_ms, raw_tx, signal).await
+            capture_frames(track, input, duration_ms, raw_tx, signal, origin).await
         }
     };
     let encode = async { worker.await? };
-    let (_, (), sent_packets) = tokio::try_join!(send, acquire, encode)?;
+    let (mut timings, (), sent_packets) = tokio::try_join!(send, acquire, encode)?;
     ensure!(sent_packets > 0, "empty published track");
+    timings.sort_unstable_by_key(|timing| timing.packet_id_us);
+    let summary = timing_summary(&timings);
     Ok(Observed {
         track: track.label(),
         sent_packets,
+        timings,
+        timing_summary: summary,
         ..Observed::default()
     })
 }
@@ -362,8 +586,9 @@ struct Observed {
     fingerprint: u32,
     first_decoded_us: u64,
     last_decoded_us: u64,
-    pipeline_p50_us: u64,
-    pipeline_p95_us: u64,
+    timings: Vec<TimingSample>,
+    timing_summary: TimingSummary,
+    decoded_frames_per_second: f64,
     #[serde(skip_serializing_if = "is_zero")]
     playback_bytes: usize,
 }
@@ -374,9 +599,10 @@ fn is_zero(value: &usize) -> bool {
 
 async fn present(
     track: Track,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<PresentedPacket>,
     audio_output: Option<DeviceSelector>,
-) -> Result<usize> {
+    origin: Instant,
+) -> Result<(usize, Vec<TimingSample>)> {
     use std::process::Stdio;
     use tokio::{io::AsyncWriteExt, process::Command};
 
@@ -407,10 +633,21 @@ async fn present(
     let mut stdin = child.stdin.take().context("missing playback pipe")?;
     let mut delivered = 0;
     let mut dismissed = false;
-    while let Some(bytes) = rx.recv().await {
+    let mut timings = Vec::new();
+    while let Some(packet) = rx.recv().await {
         if !dismissed {
-            match stdin.write_all(&bytes).await {
-                Ok(()) => delivered += bytes.len(),
+            let mut timing = TimingSample {
+                packet_id_us: packet.packet_id_us,
+                playback_submit_start_us: Some(elapsed_micros(origin)?),
+                ..TimingSample::default()
+            };
+            match stdin.write_all(&packet.bytes).await {
+                Ok(()) => {
+                    delivered += packet.bytes.len();
+                    timing.playback_submit_end_us = Some(elapsed_micros(origin)?);
+                    timing.playback_queue_depth = Some(packet.playback_queue_depth);
+                    timings.push(timing);
+                }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::BrokenPipe
                         && track != Track::Microphone =>
@@ -428,15 +665,15 @@ async fn present(
         ensure!(child.wait().await?.success(), "playback helper failed");
     }
     ensure!(delivered > 0 || dismissed, "playback had no decoded output");
-    Ok(delivered)
+    Ok((delivered, timings))
 }
 
 fn decode_track(
     track: Track,
     config: Bytes,
-    mut rx: mpsc::Receiver<types::MediaPacket>,
-    origin: Option<Instant>,
-    playback: Option<mpsc::Sender<Vec<u8>>>,
+    mut rx: mpsc::Receiver<ReceivedPacket>,
+    origin: Instant,
+    playback: Option<mpsc::Sender<PresentedPacket>>,
 ) -> Result<Observed> {
     let mut decoder = Decoder::new(track, &config)?;
     let mut observed = Observed {
@@ -445,53 +682,62 @@ fn decode_track(
     };
     let mut last_pts = 0;
     let mut crossings = 0;
-    let mut timings = Vec::new();
     let mut output = playback.as_ref().map(|_| vec![0; MAX_PACKET]);
-    while let Some(packet) = rx.blocking_recv() {
+    while let Some(ReceivedPacket { packet, mut timing }) = rx.blocking_recv() {
         ensure!(
             packet.header.pts > last_pts,
             "non-increasing media timestamp"
         );
+        ensure!(
+            timing.packet_id_us == packet.header.pts,
+            "packet timing identity mismatch"
+        );
         last_pts = packet.header.pts;
+        timing.decode_start_us = Some(elapsed_micros(origin)?);
         let decoded = if let (Some(tx), Some(buffer)) = (&playback, &mut output) {
             let (decoded, frames) = decoder.decode_output(&packet.payload, buffer)?;
+            timing.decode_end_us = Some(elapsed_micros(origin)?);
             if !frames.is_empty() {
-                tx.blocking_send(frames.to_vec())?;
+                timing.playback_queue_depth = Some(tx.max_capacity().saturating_sub(tx.capacity()));
+                tx.blocking_send(PresentedPacket {
+                    packet_id_us: timing.packet_id_us,
+                    playback_queue_depth: timing.playback_queue_depth.unwrap_or(0),
+                    bytes: frames.to_vec(),
+                })?;
+                timing.playback_enqueue_us = Some(elapsed_micros(origin)?);
             }
             decoded
         } else {
-            decoder.decode(&packet.payload)?
+            let decoded = decoder.decode(&packet.payload)?;
+            timing.decode_end_us = Some(elapsed_micros(origin)?);
+            decoded
         };
         observed.received_packets += 1;
         if decoded.frames != 0 {
-            let now = match origin {
-                Some(start) => u64::try_from(start.elapsed().as_micros())? + 1,
-                None => wall_micros()?,
-            };
+            let now = elapsed_micros(origin)? + 1;
             if observed.first_decoded_us == 0 {
                 observed.first_decoded_us = now;
             }
             observed.last_decoded_us = now;
-            if origin.is_none()
-                && let Some(elapsed) = now.checked_sub(last_pts)
-            {
-                timings.push(elapsed);
-            }
         }
         observed.decoded_frames += decoded.frames;
         observed.samples += decoded.samples;
         crossings += decoded.crossings;
         observed.fingerprint = observed.fingerprint.rotate_left(5) ^ decoded.fingerprint;
+        observed.timings.push(timing);
     }
     ensure!(observed.decoded_frames != 0, "empty decoded track");
     if observed.samples != 0 {
         observed.tone_hz =
             f64::from(crossings) * f64::from(AUDIO_RATE) / f64::from(observed.samples);
     }
-    timings.sort_unstable();
-    if !timings.is_empty() {
-        observed.pipeline_p50_us = timings[(timings.len() - 1) * 50 / 100];
-        observed.pipeline_p95_us = timings[(timings.len() - 1) * 95 / 100];
+    observed.timing_summary = timing_summary(&observed.timings);
+    let decoded_span = observed
+        .last_decoded_us
+        .saturating_sub(observed.first_decoded_us);
+    if decoded_span > 0 {
+        observed.decoded_frames_per_second =
+            f64::from(observed.decoded_frames) * 1_000_000.0 / decoded_span as f64;
     }
     Ok(observed)
 }
@@ -499,7 +745,7 @@ fn decode_track(
 async fn subscribe(
     (track, endpoint): Inbound,
     progress: PathBuf,
-    origin: Option<Instant>,
+    origin: Instant,
     playback: bool,
     audio_output: Option<DeviceSelector>,
 ) -> Result<Observed> {
@@ -537,7 +783,12 @@ async fn subscribe(
                     && received < MAX_RECEIVED_PACKETS,
                 "invalid or excess media data"
             );
-            tx.send(packet).await?;
+            let timing = TimingSample {
+                packet_id_us: packet.header.pts,
+                transport_receive_us: Some(elapsed_micros(origin)?),
+                ..TimingSample::default()
+            };
+            tx.send(ReceivedPacket { packet, timing }).await?;
             if received == 0 {
                 tokio::fs::write(&progress, b"receiving").await?;
             }
@@ -547,14 +798,28 @@ async fn subscribe(
     };
     let render = async {
         if playback {
-            present(track, output, audio_output).await
+            present(track, output, audio_output, origin).await
         } else {
-            Ok(0)
+            Ok((0, Vec::new()))
         }
     };
     let decode = async { worker.await? };
-    let (_, delivered, mut observed) = tokio::try_join!(receive, render, decode)?;
+    let (_, (delivered, playback_timings), mut observed) =
+        tokio::try_join!(receive, render, decode)?;
     observed.playback_bytes = delivered;
+    let playback: std::collections::HashMap<_, _> = playback_timings
+        .into_iter()
+        .map(|timing| (timing.packet_id_us, timing))
+        .collect();
+    for timing in &mut observed.timings {
+        if let Some(presented) = playback.get(&timing.packet_id_us) {
+            timing.playback_queue_depth = presented.playback_queue_depth;
+            timing.playback_enqueue_us = presented.playback_enqueue_us;
+            timing.playback_submit_start_us = presented.playback_submit_start_us;
+            timing.playback_submit_end_us = presented.playback_submit_end_us;
+        }
+    }
+    observed.timing_summary = timing_summary(&observed.timings);
     Ok(observed)
 }
 
@@ -640,7 +905,7 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
 
         let duration =
             Duration::from_millis(config.duration_ms + config.capture_wait_ms) + SETUP_TIMEOUT;
-        let origin = (lan || cfg!(target_os = "linux")).then(Instant::now);
+        let origin = Instant::now();
         let result = timeout(duration, async {
             let mut tasks = JoinSet::new();
             let source = u32::from(role == Role::Initiator);
@@ -659,7 +924,7 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
                 let input = config.input(track);
                 let ready = screen_ready.clone();
                 tasks.spawn(async move {
-                    publish(endpoint, source, duration_ms, input, ready)
+                    publish(endpoint, source, duration_ms, input, ready, origin)
                         .await
                         .with_context(|| format!("publishing {}", track.label()))
                 });
@@ -709,4 +974,74 @@ async fn main() -> Result<()> {
         .context("usage: skyber-a1-peer [--lan] [--capture] [--playback] RUN_DIRECTORY")?;
     ensure!(args.next().is_none(), "unexpected peer arguments");
     run(&PathBuf::from(directory), lan, live, playback).await
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::{TimingSample, packet_rate, percentiles, timing_summary};
+
+    #[test]
+    fn empty_percentiles_have_no_duration_claim() {
+        let stats = percentiles(Vec::new());
+        assert_eq!(stats.samples, 0);
+        assert_eq!(stats.p50_us, None);
+        assert_eq!(stats.p95_us, None);
+    }
+
+    #[test]
+    fn percentiles_use_sorted_microsecond_samples() {
+        let stats = percentiles(vec![40, 10, 30, 20]);
+        assert_eq!(stats.samples, 4);
+        assert_eq!(stats.p50_us, Some(20));
+        assert_eq!(stats.p95_us, Some(30));
+    }
+
+    #[test]
+    fn packet_rate_requires_distinct_local_timestamps() {
+        let samples = [
+            TimingSample {
+                source_ready_us: Some(100),
+                ..TimingSample::default()
+            },
+            TimingSample {
+                source_ready_us: Some(500_100),
+                ..TimingSample::default()
+            },
+        ];
+        let rate = packet_rate(&samples, |sample| sample.source_ready_us);
+        assert_eq!(rate, Some(2.0));
+        assert_eq!(
+            packet_rate(&samples[..1], |sample| sample.source_ready_us),
+            None
+        );
+    }
+
+    #[test]
+    fn summary_only_uses_durations_from_one_peer_clock() {
+        let sample = TimingSample {
+            packet_id_us: 700,
+            source_ready_us: Some(100),
+            encode_start_us: Some(110),
+            encode_end_us: Some(130),
+            transport_send_start_us: Some(150),
+            transport_send_end_us: Some(160),
+            transport_receive_us: Some(900),
+            decode_start_us: Some(920),
+            decode_end_us: Some(950),
+            playback_enqueue_us: Some(960),
+            playback_submit_start_us: Some(970),
+            playback_submit_end_us: Some(980),
+            ..TimingSample::default()
+        };
+        let summary = timing_summary(&[sample]);
+        assert_eq!(summary.clock_domain, "peer_monotonic_us_since_media_start");
+        assert_eq!(summary.source_to_encode_us.p50_us, Some(10));
+        assert_eq!(summary.encode_us.p50_us, Some(20));
+        assert_eq!(summary.encode_to_transport_us.p50_us, Some(20));
+        assert_eq!(summary.transport_send_us.p50_us, Some(10));
+        assert_eq!(summary.receive_to_decode_us.p50_us, Some(20));
+        assert_eq!(summary.decode_us.p50_us, Some(30));
+        assert_eq!(summary.decode_to_playback_queue_us.p50_us, Some(10));
+        assert_eq!(summary.playback_submit_us.p50_us, Some(10));
+    }
 }

@@ -61,6 +61,52 @@ def process_cpu_ms(pid: int) -> float:
         kernel.CloseHandle(process)
 
 
+def verify_timing(row: dict) -> None:
+    samples = row.get("timings")
+    require(isinstance(samples, list), "missing per-packet timing samples")
+    summary = row.get("timing_summary", {})
+    require(summary.get("clock_domain") == "peer_monotonic_us_since_media_start",
+            "timing clock domain is missing or changed")
+    if row["sent_packets"]:
+        require(len(samples) == row["sent_packets"], "published timing sample count changed")
+        require(summary["encode_us"]["samples"] == row["sent_packets"]
+                and summary["transport_send_us"]["samples"] == row["sent_packets"],
+                "published stage sample count changed")
+        require(summary["encode_queue_depth_max"] <= 2,
+                "encoded packet queue exceeded its bound")
+        for sample in samples:
+            require(all(isinstance(sample.get(name), int) for name in (
+                "packet_id_us", "source_ready_us", "encode_start_us", "encode_end_us",
+                "transport_send_start_us", "transport_send_end_us")),
+                "published packet is missing a timing boundary")
+            require(sample["source_ready_us"] <= sample["encode_start_us"]
+                    <= sample["encode_end_us"]
+                    <= sample["transport_send_start_us"]
+                    <= sample["transport_send_end_us"],
+                    "published timing boundaries are out of order")
+    if row["received_packets"]:
+        require(len(samples) == row["received_packets"], "received timing sample count changed")
+        require(summary["decode_us"]["samples"] == row["received_packets"],
+                "decoded stage sample count changed")
+        require(summary["playback_queue_depth_max"] <= 2,
+                "playback queue exceeded its bound")
+        for sample in samples:
+            require(all(isinstance(sample.get(name), int) for name in (
+                "packet_id_us", "transport_receive_us", "decode_start_us", "decode_end_us")),
+                "received packet is missing a timing boundary")
+            require(sample["transport_receive_us"] <= sample["decode_start_us"]
+                    <= sample["decode_end_us"],
+                    "received timing boundaries are out of order")
+        if row.get("playback_bytes", 0):
+            presented = [sample for sample in samples
+                         if sample.get("playback_submit_start_us") is not None]
+            require(bool(presented), "playback has no submission timestamps")
+            require(all(sample["playback_submit_start_us"] <= sample["playback_submit_end_us"]
+                        for sample in presented), "playback submission timing is out of order")
+            require(summary["playback_submit_us"]["samples"] == len(presented),
+                    "playback stage sample count changed")
+
+
 def verify_media(output: Path, profile: str, direction: str, stop_screen: bool, *, lan: bool = False) -> None:
     received = []
     track_names = ["microphone"]
@@ -70,6 +116,8 @@ def verify_media(output: Path, profile: str, direction: str, stop_screen: bool, 
         track_names.append("screen")
     for role, other in [ROLES, ROLES[::-1]]:
         rows = read_result(output, role)["tracks"]
+        for row in rows:
+            verify_timing(row)
         incoming = {row["track"]: row for row in rows if row["received_packets"]}
         outgoing = {row["track"]: row for row in rows if row["sent_packets"]}
         expected_out = set(track_names) if direction in ("both", role) else set()
