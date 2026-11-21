@@ -100,12 +100,24 @@ Initial target: Windows 11 desktop; architect for Linux and macOS. One-to-one ca
 
 ### Gate A — Kyber interoperability and bidirectional API
 
+**A1 — one Windows 11 machine, loopback (first).**
+
 1. Pin exact Kyber release/commit (current documented release: **0.29.0, 2026-10-09**).
 2. Audit upstream: https://gitlab.com/kyber/kyber and https://gitlab.com/kyber/core/kysdk; inspect SDK APIs and examples.
-3. On two Windows hosts on LAN, establish both media directions using native Kyber components, with independent local webcam and mic. Determine if a user can act as both client and host without conflicting services, devices, ports, capture ownership or trust assumptions.
-4. Demonstrate **simultaneous webcam + screen capture**, if possible. Record any missing APIs, proposed adapter/fork and upstream contribution opportunities.
-5. Trace the actual source/capture/encode/transport/decode/render path; identify any audio echo cancellation missing.
-6. Deliver minimal reproducible prototype, demo video, logs and a go/no-go decision. **Do not build the contact system before establishing this feasibility.**
+3. Run two independent local participants using `127.0.0.1`/loopback, with separate processes and ports. Establish both directions of Kyber AV using native components; determine if one host can publish and receive without conflicting roles, ports, devices or capture ownership.
+4. Use synthetic camera and audio sources for at least one participant where simultaneous opening of a physical device is unreliable. Demonstrate simultaneous **webcam + screen capture** if possible. Record any missing APIs, necessary adapter/fork and upstream contribution opportunities.
+5. Trace source/capture/encode/transport/decode/render and note missing echo cancellation. Record latency through the software pipeline; **loopback is not a real LAN latency or acoustic echo-cancellation test**.
+6. Deliver a reproducible two-process proof, logs and blockers before building contacts.
+
+**A2 — Windows 11 + Linux on two physical machines over LAN (after A1).**
+
+1. Use the Windows 11 development computer as peer A, and a supported Linux desktop (preferably recent Ubuntu) as peer B. Verify exact Linux distribution, desktop session (X11/Wayland) and Kyber capture/codec support first.
+2. Run bidirectional video and audio with independent physical capture/playback devices; add simultaneous webcam and screen share where Kyber supports it. Test Qt floating-window rendering on Windows, and preferably Linux too.
+3. Measure end-to-end glass-to-glass video latency, audio delay and A/V synchronization across a genuine LAN. Test acoustic echo cancellation, device changes, sustained calls, disconnect and reconnect.
+4. Record Linux-specific GPU capture/encode/decode limitations, cross-platform media negotiation, timestamps and transport issues. Deliver a reproducible two-host demo and go/no-go decision.
+5. **Windows 7 is not a supported A2 target:** Kyber's Windows notes list Windows 10/11/Server 2022 as tested, and Qt 6 does not support Windows 7. A dedicated legacy compatibility experiment may be considered later but must not determine the core architecture or block development.
+
+**Do not build the contact system before achieving A1 feasibility; validate A2 before promising real-world cross-platform calling.**
 
 ### Gate B — borderless floating GPU video
 
@@ -130,7 +142,7 @@ Initial target: Windows 11 desktop; architect for Linux and macOS. One-to-one ca
 | **2 — Screen-share MVP** | Screen/window selection, shared-screen independent window/view, remote webcam stays floating; simultaneous camera+screen. | Each peer can independently share, stop and switch; predictable consent and latency. |
 | **3 — Contacts and live chat** | Invite/contact management, searchable contacts, text chat, SQLite history, read/unread and identity state. | Tests cover contact acceptance, blocking, message ordering, reconnect and no-content leaks. |
 | **4 — Internet connectivity** | Rendezvous/signaling, direct connection attempts, relay fallback, secure identity and presence. | Real residential/corporate topology matrix; no unjustified E2EE claims. |
-| **5 — Polish and cross-platform** | Echo cancellation/audio quality, adaptive QoS, release packaging/signatures, Linux/macOS integration. | Cross-platform acceptance matrix; measured performance and documented limitations. |
+| **5 — Polish and cross-platform** | Echo cancellation/audio quality, adaptive QoS, release packaging/signatures, macOS integration and broader Linux compatibility. | Cross-platform acceptance matrix; measured performance and documented limitations. |
 | **Later** | Offline encrypted messaging, files, group calling, mobile, richer screen/audio controls. | Only after one-to-one experience is stable. |
 
 Increments 2 and 3 may be developed in parallel **after** the transport/window spike, while Internet functionality should be prototyped early to avoid a late architectural dead end.
@@ -198,3 +210,7 @@ Use feature-gated fake media sources and reproducible transport test harnesses r
 - Qt Bridge for Rust beta (2026): https://www.qt.io/blog/qt-bridge-for-rust-0.3-cxx-qt-compatibility-and-soundness
 
 All recommendations are provisional until Gates A–C. Do not represent proposed functionality, concurrency or P2P behavior as already implemented by the Kyber SDK.
+
+- Windows platform support: https://docs.kyber.tech/docs/GettingStarted/Kyber-installation-notes-windows/
+- Linux platform installation: https://docs.kyber.tech/docs/GettingStarted/Kyber-installation-notes-linux/
+- Qt 6 Windows supported configurations: https://doc.qt.io/qt-6/windows.html
