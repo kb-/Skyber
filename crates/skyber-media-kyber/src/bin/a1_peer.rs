@@ -78,23 +78,37 @@ struct Settings {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceCapture {
-    microphone: u32,
-    camera: u32,
+    microphone: DeviceSelector,
+    camera: DeviceSelector,
     screen: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum DeviceSelector {
+    Windows(u32),
+    Ubuntu(String),
+}
+
+impl DeviceSelector {
+    fn matches_platform(&self) -> bool {
+        matches!(self, Self::Windows(_) if cfg!(windows))
+            || matches!(self, Self::Ubuntu(_) if cfg!(target_os = "linux"))
+    }
+}
+
+#[derive(Clone)]
 enum Input {
     Synthetic,
-    Device(u32),
+    Device(DeviceSelector),
     ScreenPicker,
 }
 
 impl Settings {
     fn input(&self, track: Track) -> Input {
         match (&self.capture, track) {
-            (Some(capture), Track::Microphone) => Input::Device(capture.microphone),
-            (Some(capture), Track::Camera) => Input::Device(capture.camera),
+            (Some(capture), Track::Microphone) => Input::Device(capture.microphone.clone()),
+            (Some(capture), Track::Camera) => Input::Device(capture.camera.clone()),
             (Some(_), Track::Screen) => Input::ScreenPicker,
             (None, _) => Input::Synthetic,
         }
@@ -131,11 +145,12 @@ impl Settings {
         );
         if let Some(capture) = &config.capture {
             ensure!(
-                cfg!(windows)
+                capture.microphone.matches_platform()
+                    && capture.camera.matches_platform()
                     && config.direction.sends(config.role)
                     && !matches!(config.profile, Profile::Audio)
                     && capture.screen == matches!(config.profile, Profile::AvWithScreen),
-                "invalid Windows capture profile"
+                "invalid capture profile or device selector for this platform"
             );
         }
         Ok(config)
@@ -235,24 +250,32 @@ async fn capture_frames(
     use std::process::Stdio;
     use tokio::{io::AsyncReadExt, process::Command};
 
-    let helper = std::env::current_exe()?.with_file_name("skyber-windows-capture.exe");
+    let name = if cfg!(windows) {
+        "skyber-windows-capture.exe"
+    } else {
+        "skyber-ubuntu-capture"
+    };
+    let helper = std::env::current_exe()?.with_file_name(name);
     let mut command = Command::new(helper);
+    let duration = duration_ms.to_string();
     match input {
-        Input::Device(index) => {
-            command.args(["--stream", track.label(), &index.to_string()]);
+        Input::Device(DeviceSelector::Windows(index)) => {
+            command.args(["--stream", track.label(), &index.to_string(), &duration]);
+        }
+        Input::Device(DeviceSelector::Ubuntu(device)) => {
+            command.args([track.label(), &duration, "--device", &device]);
         }
         Input::ScreenPicker => {
-            command.arg("--screen");
+            command.args([if cfg!(windows) { "--screen" } else { "screen" }, &duration]);
         }
         Input::Synthetic => anyhow::bail!("synthetic input does not start a capture helper"),
     }
     let mut child = command
-        .arg(duration_ms.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("start Windows capture helper")?;
+        .context("start platform capture helper")?;
     let mut stdout = child.stdout.take().context("missing capture pipe")?;
     let size = if track == Track::Microphone {
         1920 * 4
@@ -301,7 +324,7 @@ async fn publish(
         if matches!(input, Input::Synthetic) {
             Ok(())
         } else {
-            if let (Input::Device(_), Some(ready)) = (input, &screen_ready) {
+            if let (Input::Device(_), Some(ready)) = (&input, &screen_ready) {
                 let mut signal = ready.subscribe();
                 signal.wait_for(|ready| *ready).await?;
             }
@@ -458,12 +481,14 @@ async fn run(directory: &Path, lan: bool, live: bool) -> Result<()> {
         _ => anyhow::bail!("invalid role-specific LAN addresses"),
     };
     kynet::init_crypto();
+    // The authenticated call may be quiet while the operator is in the screen picker.
+    let keep_alive = config.capture_wait_ms > 0;
     let server = if role == Role::Listener {
         let cert = directory.join("cert.pem");
         let key = directory.join("key.pem");
         let server = match lan_address {
-            Some(address) => transport::listen_lan(address, &cert, &key).await?,
-            None => transport::listen(address, &cert, &key).await?,
+            Some(address) => transport::listen_lan(address, &cert, &key, keep_alive).await?,
+            None => transport::listen(address, &cert, &key, keep_alive).await?,
         };
         std::fs::write(directory.join("ready"), b"listening")?;
         Some(server)
@@ -479,9 +504,21 @@ async fn run(directory: &Path, lan: bool, live: bool) -> Result<()> {
         if let Some(server) = &server {
             transport::accept(server, &config.secret).await
         } else if let Some(address) = lan_address {
-            transport::connect_lan(address, config.fingerprint.clone(), &config.secret).await
+            transport::connect_lan(
+                address,
+                config.fingerprint.clone(),
+                &config.secret,
+                keep_alive,
+            )
+            .await
         } else {
-            transport::connect(address, config.fingerprint.clone(), &config.secret).await
+            transport::connect(
+                address,
+                config.fingerprint.clone(),
+                &config.secret,
+                keep_alive,
+            )
+            .await
         }
     })
     .await

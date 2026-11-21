@@ -158,7 +158,7 @@ Do not equate a pass on a VM virtual device with a pass on bare-metal driver/har
 
 1. **PR A2-0:** native Linux media build, explicit LAN bind/connect/auth configuration, cross-platform synthetic compatibility, instructions and structured two-host runner. Must not weaken existing A1 loopback safety.
 2. **PR A2-1a:** Windows webcam/mic/screen capture, device interfaces and consent; small focused Windows manual acceptance. [Windows capture acceptance evidence](ADR/A2-1A_WINDOWS_CAPTURE.md#a2-1a-acceptance-evidence).
-3. **PR A2-1b:** Ubuntu V4L2/audio/screen capture, portal permission handling and limitations; VM-specific manual acceptance.
+3. **PR A2-1b:** Ubuntu V4L2/audio/screen capture, portal permission handling and limitations; VM-specific manual acceptance. [Ubuntu capture acceptance evidence](ADR/A2-1B_UBUNTU_CAPTURE.md#a2-1b-acceptance-evidence).
 4. **PR A2-1c:** real audio playback, minimal decoded camera/screen viewer, independent track lifecycle, error/state surfaces.
 5. **PR A2-2:** accurate metrics, glass-to-glass methodology and benchmarks.
 6. **PR A2-3:** reliable/unreliable media transport behavior investigation, network impairment, reconnection, negative packet/FFI cases, long stability tests.
