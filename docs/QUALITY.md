@@ -95,7 +95,7 @@ Run platform-appropriate feature combinations in CI instead of blindly selecting
 2. **B / MVP:** Qt Quick Test, Rust coverage, explicit FFI safety test suite, visual snapshot checks for remote floating window.
 3. **A2 / Internet:** fuzzing of network inputs, real LAN hardware lane, impairment/soak tests, performance regression baselines and release validation.
 
-See [TESTING.md](TESTING.md), [CODING_STYLE.md](CODING_STYLE.md), [AGENT.md](../AGENT.md), and [Skyber architecture](PLAN_SKYBER.md).
+See [TESTING.md](TESTING.md), [CODING_STYLE.md](CODING_STYLE.md), [AGENTS.md](../AGENTS.md), and [Skyber architecture](PLAN_SKYBER.md).
 
 ## References
 

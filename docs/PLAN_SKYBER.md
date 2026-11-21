@@ -221,6 +221,6 @@ The implementation shall follow:
 - [Code quality and toolchain policy](QUALITY.md) — Rust/QML linting, dependency/license controls, CI tiers, code coverage, PR requirements.
 - [Testing strategy](TESTING.md) — deterministic local A1 versus physical Windows 11–Linux A2 and specialized multimedia tests.
 - [Coding style](CODING_STYLE.md) — Rust, Qt Quick/QML, C++ FFI, threading, security, and performance conventions.
-- [AGENT.md](../AGENT.md) and [AGENTS.md](../AGENTS.md) — detailed coding-agent instructions and auto-discovery entry point.
+- [AGENTS.md](../AGENTS.md) — the single authoritative coding-agent instruction file.
 
 These documents are **proposed policy**, not claims that the associated build files, binaries or CI checks have been implemented.
