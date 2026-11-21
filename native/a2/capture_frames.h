@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include <io.h>
 
 namespace capture {
+inline const auto process_start = std::chrono::steady_clock::now();
 constexpr int width = 320;
 constexpr int height = 180;
 constexpr int audio_samples = 960 * 2;
@@ -19,7 +21,15 @@ inline bool binary_stdout() {
 }
 
 inline bool send(const void *data, std::size_t bytes) {
-    return std::fwrite(data, 1, bytes, stdout) == bytes && std::fflush(stdout) == 0;
+    const auto elapsed = std::chrono::steady_clock::now() - process_start;
+    const auto timestamp = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+    std::array<std::uint8_t, sizeof(timestamp)> header{};
+    for (std::size_t i = 0; i < header.size(); ++i) {
+        header[i] = static_cast<std::uint8_t>(timestamp >> (i * 8));
+    }
+    return std::fwrite(header.data(), 1, header.size(), stdout) == header.size()
+        && std::fwrite(data, 1, bytes, stdout) == bytes && std::fflush(stdout) == 0;
 }
 
 inline std::uint8_t channel(int value) {

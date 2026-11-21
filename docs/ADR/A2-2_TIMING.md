@@ -20,7 +20,8 @@ The current boundaries are:
 
 | Field | Boundary |
 | --- | --- |
-| `source_ready_us` | Rust has read a complete fixed-size frame from the capture helper pipe. This is not the camera sensor's exposure time. |
+| `capture_helper_timestamp_us` | The platform capture helper's monotonic timestamp immediately before writing a complete fixed-size sample to its pipe, relative to helper start. This is not the camera sensor's exposure time and uses a separate helper clock domain. |
+| `source_ready_us` | Rust has read a complete fixed-size frame and its timestamp from the capture helper pipe, relative to peer media-run start. |
 | `encode_start_us`, `encode_end_us` | Around input conversion and the software codec call. |
 | `encode_queue_depth` | Number of entries already in the bounded encoded-packet queue before enqueue. |
 | `transport_send_start_us`, `transport_send_end_us` | Immediately around the Kyber media `send` call. This is not a network delivery or acknowledgment time. |
@@ -29,7 +30,10 @@ The current boundaries are:
 | `playback_queue_depth`, `playback_enqueue_us` | Queue state and enqueue completion for decoded bytes accepted by the presentation task. |
 | `playback_submit_start_us`, `playback_submit_end_us` | Rust's write of decoded bytes to the platform helper pipe. This is not display scanout or speaker completion. |
 
-Each track result includes per-packet samples and p50/p95 durations with
+Each capture helper prefixes every fixed-size sample with an unsigned
+little-endian 64-bit helper-relative monotonic timestamp. The peer records
+that value without subtracting it from a Rust or receiver clock. Each track
+result includes per-packet samples and p50/p95 durations with
 sample counts. Queue depths are recorded for the capture, encode and
 playback queues. The samples contain timing values and packet IDs only,
 never media bytes. The sender's packet PTS is a correlation key; a
@@ -60,6 +64,18 @@ The microphone run lengths differ because the live capture helpers finish
 their fixed sample/frame windows at different times. This is an initial
 instrumentation result and does not close the A2-2 gate.
 
+### Helper timestamp protocol check
+
+On the same Windows host and Ubuntu 26.04.1 guest, the updated Windows
+Media Foundation and Ubuntu GStreamer helpers were exercised through the
+live capture loopback suite. Every published media packet had one
+helper-relative monotonic timestamp, the timestamps strictly increased,
+and live track packet counts verified on both peers. The Windows helper
+reported 217 microphone packets and 49 camera frames; Ubuntu with the
+Logitech C922 reported 219 microphone packets and 71 camera frames. Media
+payloads remained in memory. This checks the new local binary pipe framing;
+it is not a hardware sensor timestamp or an end-to-end LAN latency sample.
+
 These measurements describe application boundaries. They do not
 measure camera exposure, transport one-way latency, visible display
 presentation, acoustic output, or glass-to-glass delay. In particular,
@@ -67,9 +83,9 @@ the playback submission boundary ends at the helper pipe. The existing
 native helpers report completed audio output and rendered video counts,
 but do not yet report per-packet device presentation timestamps.
 
-The remaining A2-2 work is to timestamp capture inside the platform
-helpers, add native audio/video presentation events, expose supported
-Kyber RTT and loss data, and collect CPU, memory, frame-rate and drop
-measurements. Glass-to-glass video and audio delay require an external
-reference such as a high-speed camera and LED/display. These are
-separate from the per-peer monotonic measurements above.
+The remaining A2-2 work is to add native audio/video presentation events,
+expose supported Kyber RTT and loss data, and collect CPU, memory,
+frame-rate and drop measurements. Glass-to-glass video and audio delay
+require an external reference such as a high-speed camera and
+LED/display. These are separate from the per-peer monotonic measurements
+above.

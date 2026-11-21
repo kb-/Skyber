@@ -190,6 +190,7 @@ fn media(pts: u64, payload: Bytes, is_config: bool, is_key: bool) -> Result<type
 struct SourceFrame {
     bytes: Vec<u8>,
     source_ready_us: u64,
+    capture_helper_timestamp_us: u64,
     capture_queue_depth: usize,
 }
 
@@ -213,6 +214,7 @@ struct PresentedPacket {
 struct TimingSample {
     packet_id_us: u64,
     source_ready_us: Option<u64>,
+    capture_helper_timestamp_us: Option<u64>,
     capture_queue_depth: Option<usize>,
     encode_start_us: Option<u64>,
     encode_end_us: Option<u64>,
@@ -430,6 +432,9 @@ fn encode_track(
             let mut timing = TimingSample {
                 packet_id_us: pts,
                 source_ready_us: Some(source_ready_us),
+                capture_helper_timestamp_us: captured
+                    .as_ref()
+                    .map(|frame| frame.capture_helper_timestamp_us),
                 encode_start_us: Some(encode_start_us),
                 encode_end_us: Some(encode_end_us),
                 encode_queue_depth: Some(encode_queue_depth),
@@ -495,10 +500,16 @@ async fn capture_frames(
     };
     let mut ready = ready;
     loop {
-        let mut frame = vec![0; size];
-        if stdout.read(&mut frame[..1]).await? == 0 {
+        let mut timestamp = [0; 8];
+        if stdout.read(&mut timestamp[..1]).await? == 0 {
             break;
         }
+        stdout
+            .read_exact(&mut timestamp[1..])
+            .await
+            .context("truncated capture timestamp")?;
+        let mut frame = vec![0; size];
+        stdout.read_exact(&mut frame[..1]).await?;
         stdout
             .read_exact(&mut frame[1..])
             .await
@@ -509,6 +520,7 @@ async fn capture_frames(
         let queued = SourceFrame {
             bytes: frame,
             source_ready_us: elapsed_micros(origin)?,
+            capture_helper_timestamp_us: u64::from_le_bytes(timestamp),
             capture_queue_depth: channel.max_capacity().saturating_sub(channel.capacity()),
         };
         channel.send(queued).await?;

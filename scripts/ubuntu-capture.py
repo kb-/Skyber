@@ -5,6 +5,7 @@ import argparse
 import os
 import re
 import stat
+import struct
 import sys
 import time
 import uuid
@@ -188,6 +189,7 @@ def capture(kind: str, duration_ms: int, device: str | None,
     sink = pipeline.get_by_name("frames")
     bus = pipeline.get_bus()
     start = None
+    helper_start_ns = time.monotonic_ns()
     last_sample = time.monotonic()
     sent = 0
     pending = bytearray()
@@ -216,13 +218,18 @@ def capture(kind: str, duration_ms: int, device: str | None,
                     raise CaptureError("invalid PCM buffer size")
                 pending.extend(buffer.extract_dup(0, size))
                 whole = len(pending) // PCM_BYTES * PCM_BYTES
-                if whole:
-                    sys.stdout.buffer.write(pending[:whole])
-                    del pending[:whole]
-                    sent += whole // PCM_BYTES
+                while whole:
+                    timestamp_us = (time.monotonic_ns() - helper_start_ns) // 1000
+                    sys.stdout.buffer.write(struct.pack("<Q", timestamp_us))
+                    sys.stdout.buffer.write(pending[:PCM_BYTES])
+                    del pending[:PCM_BYTES]
+                    whole -= PCM_BYTES
+                    sent += 1
             else:
                 if size != I420_BYTES:
                     raise CaptureError(f"invalid I420 frame size ({size})")
+                timestamp_us = (time.monotonic_ns() - helper_start_ns) // 1000
+                sys.stdout.buffer.write(struct.pack("<Q", timestamp_us))
                 sys.stdout.buffer.write(buffer.extract_dup(0, size))
                 sent += 1
             sys.stdout.buffer.flush()

@@ -74,6 +74,12 @@ def verify_timing(row: dict) -> None:
                 "published stage sample count changed")
         require(summary["encode_queue_depth_max"] <= 2,
                 "encoded packet queue exceeded its bound")
+        helper_times = [sample.get("capture_helper_timestamp_us") for sample in samples]
+        if any(timestamp is not None for timestamp in helper_times):
+            require(all(isinstance(timestamp, int) and timestamp >= 0 for timestamp in helper_times),
+                    "capture helper timestamp is missing or invalid")
+            require(all(left < right for left, right in zip(helper_times, helper_times[1:])),
+                    "capture helper timestamps are not increasing")
         for sample in samples:
             require(all(isinstance(sample.get(name), int) for name in (
                 "packet_id_us", "source_ready_us", "encode_start_us", "encode_end_us",
