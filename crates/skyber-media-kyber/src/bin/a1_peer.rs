@@ -10,10 +10,14 @@ use kymux::{kynet, types};
 use serde::{Deserialize, Serialize};
 use skyber_core::Track;
 use skyber_media_kyber::{
-    native::{Decoder, Encoder, MAX_CONFIG, MAX_PACKET},
+    native::{CaptureFrame, Decoder, Encoder, MAX_CONFIG, MAX_PACKET},
     transport::{self, Inbound, LanAddress, Outbound, Role},
 };
-use tokio::{sync::mpsc, task::JoinSet, time::timeout};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+    time::timeout,
+};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_RECEIVED_PACKETS: usize = 1000;
@@ -66,6 +70,35 @@ struct Settings {
     direction: Direction,
     duration_ms: u64,
     screen_stop_ms: Option<u64>,
+    capture: Option<DeviceCapture>,
+    #[serde(default)]
+    capture_wait_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceCapture {
+    microphone: u32,
+    camera: u32,
+    screen: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Input {
+    Synthetic,
+    Device(u32),
+    ScreenPicker,
+}
+
+impl Settings {
+    fn input(&self, track: Track) -> Input {
+        match (&self.capture, track) {
+            (Some(capture), Track::Microphone) => Input::Device(capture.microphone),
+            (Some(capture), Track::Camera) => Input::Device(capture.camera),
+            (Some(_), Track::Screen) => Input::ScreenPicker,
+            (None, _) => Input::Synthetic,
+        }
+    }
 }
 
 impl Settings {
@@ -90,6 +123,19 @@ impl Settings {
                 matches!(config.profile, Profile::AvWithScreen)
                     && (500..config.duration_ms).contains(&stop),
                 "invalid screen stop time"
+            );
+        }
+        ensure!(
+            config.capture_wait_ms <= 65_000,
+            "capture setup allowance exceeds 65 seconds"
+        );
+        if let Some(capture) = &config.capture {
+            ensure!(
+                cfg!(windows)
+                    && config.direction.sends(config.role)
+                    && !matches!(config.profile, Profile::Audio)
+                    && capture.screen == matches!(config.profile, Profile::AvWithScreen),
+                "invalid Windows capture profile"
             );
         }
         Ok(config)
@@ -127,6 +173,7 @@ fn encode_track(
     track: Track,
     source: u32,
     duration_ms: u64,
+    mut capture: Option<mpsc::Receiver<Vec<u8>>>,
 ) -> Result<u32> {
     let mut encoder = Encoder::new(track, source)?;
     tx.blocking_send(types::AVPacket::Codec(types::CodecPacket {
@@ -142,11 +189,33 @@ fn encode_track(
     let start = Instant::now();
     let mut count = 0;
     let mut last_pts = 0;
-    for frame in 0..frames {
-        let deadline = start + Duration::from_micros(frame * 1_000_000 / rate);
-        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    for frame in 0.. {
+        let captured = if let Some(capture) = &mut capture {
+            let Some(bytes) = capture.blocking_recv() else {
+                break;
+            };
+            Some(bytes)
+        } else {
+            if frame >= frames {
+                break;
+            }
+            let deadline = start + Duration::from_micros(frame * 1_000_000 / rate);
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            None
+        };
         let pts = wall_micros()?.max(last_pts + 1);
-        let (payload, key) = encoder.next_packet()?;
+        let (payload, key) = match captured {
+            Some(bytes) if track == Track::Microphone => {
+                let mut samples = [0.0; 1920];
+                for (sample, bytes) in samples.iter_mut().zip(bytes.chunks_exact(4)) {
+                    let raw: [u8; 4] = bytes.try_into()?;
+                    *sample = f32::from_le_bytes(raw);
+                }
+                encoder.encode_capture(CaptureFrame::PcmF32(&samples))?
+            }
+            Some(bytes) => encoder.encode_capture(CaptureFrame::I420(&bytes))?,
+            None => encoder.next_packet()?,
+        };
         if !payload.is_empty() {
             tx.blocking_send(media(pts, Bytes::copy_from_slice(payload), false, key)?)?;
             last_pts = pts;
@@ -156,23 +225,98 @@ fn encode_track(
     Ok(count)
 }
 
-async fn publish((track, endpoint): Outbound, source: u32, duration_ms: u64) -> Result<Observed> {
+async fn capture_frames(
+    track: Track,
+    input: Input,
+    duration_ms: u64,
+    channel: mpsc::Sender<Vec<u8>>,
+    ready: Option<watch::Sender<bool>>,
+) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::{io::AsyncReadExt, process::Command};
+
+    let helper = std::env::current_exe()?.with_file_name("skyber-windows-capture.exe");
+    let mut command = Command::new(helper);
+    match input {
+        Input::Device(index) => {
+            command.args(["--stream", track.label(), &index.to_string()]);
+        }
+        Input::ScreenPicker => {
+            command.arg("--screen");
+        }
+        Input::Synthetic => anyhow::bail!("synthetic input does not start a capture helper"),
+    }
+    let mut child = command
+        .arg(duration_ms.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start Windows capture helper")?;
+    let mut stdout = child.stdout.take().context("missing capture pipe")?;
+    let size = if track == Track::Microphone {
+        1920 * 4
+    } else {
+        320 * 180 * 3 / 2
+    };
+    let mut ready = ready;
+    loop {
+        let mut frame = vec![0; size];
+        if stdout.read(&mut frame[..1]).await? == 0 {
+            break;
+        }
+        stdout
+            .read_exact(&mut frame[1..])
+            .await
+            .context("truncated capture frame")?;
+        if let Some(signal) = ready.take() {
+            signal.send_replace(true);
+        }
+        channel.send(frame).await?;
+    }
+    ensure!(child.wait().await?.success(), "capture helper failed");
+    Ok(())
+}
+
+async fn publish(
+    (track, endpoint): Outbound,
+    source: u32,
+    duration_ms: u64,
+    input: Input,
+    screen_ready: Option<watch::Sender<bool>>,
+) -> Result<Observed> {
     let mut protocol = endpoint.ready().await?;
     let (tx, mut rx) = mpsc::channel(2);
-    let worker = tokio::task::spawn_blocking(move || encode_track(tx, track, source, duration_ms));
-    let network_result = async {
+    let (raw_tx, raw_rx) = mpsc::channel(2);
+    let capture = (!matches!(input, Input::Synthetic)).then_some(raw_rx);
+    let worker =
+        tokio::task::spawn_blocking(move || encode_track(tx, track, source, duration_ms, capture));
+    let send = async {
         while let Some(packet) = rx.recv().await {
             protocol.send(packet).await?;
         }
-        Ok::<_, types::ProtocolError>(())
-    }
-    .await;
-    drop(rx);
-    let count = worker.await?;
-    network_result?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let acquire = async {
+        if matches!(input, Input::Synthetic) {
+            Ok(())
+        } else {
+            if let (Input::Device(_), Some(ready)) = (input, &screen_ready) {
+                let mut signal = ready.subscribe();
+                signal.wait_for(|ready| *ready).await?;
+            }
+            let signal = matches!(input, Input::ScreenPicker)
+                .then_some(screen_ready)
+                .flatten();
+            capture_frames(track, input, duration_ms, raw_tx, signal).await
+        }
+    };
+    let encode = async { worker.await? };
+    let (_, (), sent_packets) = tokio::try_join!(send, acquire, encode)?;
+    ensure!(sent_packets > 0, "empty published track");
     Ok(Observed {
         track: track.label(),
-        sent_packets: count?,
+        sent_packets,
         ..Observed::default()
     })
 }
@@ -298,8 +442,12 @@ async fn subscribe(
     decoded
 }
 
-async fn run(directory: &Path, lan: bool) -> Result<()> {
+async fn run(directory: &Path, lan: bool, live: bool) -> Result<()> {
     let config = Settings::load(directory)?;
+    ensure!(
+        live == config.capture.is_some(),
+        "live device input requires --capture and device settings"
+    );
     let role = config.role;
     let address: SocketAddr = (Ipv4Addr::LOCALHOST, config.port).into();
     let lan_address = match (lan, role, config.bind_address, config.remote_address) {
@@ -331,9 +479,9 @@ async fn run(directory: &Path, lan: bool) -> Result<()> {
         if let Some(server) = &server {
             transport::accept(server, &config.secret).await
         } else if let Some(address) = lan_address {
-            transport::connect_lan(address, config.fingerprint, &config.secret).await
+            transport::connect_lan(address, config.fingerprint.clone(), &config.secret).await
         } else {
-            transport::connect(address, config.fingerprint, &config.secret).await
+            transport::connect(address, config.fingerprint.clone(), &config.secret).await
         }
     })
     .await
@@ -360,11 +508,17 @@ async fn run(directory: &Path, lan: bool) -> Result<()> {
         .await
         .context("Kyber track registration timed out")??;
 
-        let duration = Duration::from_millis(config.duration_ms) + SETUP_TIMEOUT;
+        let duration =
+            Duration::from_millis(config.duration_ms + config.capture_wait_ms) + SETUP_TIMEOUT;
         let origin = (lan || cfg!(target_os = "linux")).then(Instant::now);
         let result = timeout(duration, async {
             let mut tasks = JoinSet::new();
             let source = u32::from(role == Role::Initiator);
+            let screen_ready = config
+                .capture
+                .as_ref()
+                .filter(|cap| cap.screen)
+                .map(|_| watch::channel(false).0);
             for endpoint in endpoints.outbound.drain(..) {
                 let duration_ms = if endpoint.0 == Track::Screen {
                     config.screen_stop_ms.unwrap_or(config.duration_ms)
@@ -372,8 +526,10 @@ async fn run(directory: &Path, lan: bool) -> Result<()> {
                     config.duration_ms
                 };
                 let track = endpoint.0;
+                let input = config.input(track);
+                let ready = screen_ready.clone();
                 tasks.spawn(async move {
-                    publish(endpoint, source, duration_ms)
+                    publish(endpoint, source, duration_ms, input, ready)
                         .await
                         .with_context(|| format!("publishing {}", track.label()))
                 });
@@ -413,16 +569,12 @@ async fn run(directory: &Path, lan: bool) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = std::env::args_os().skip(1);
-    let first = args
+    let mut args = std::env::args_os().skip(1).peekable();
+    let lan = args.next_if(|arg| arg == "--lan").is_some();
+    let live = args.next_if(|arg| arg == "--capture").is_some();
+    let directory = args
         .next()
-        .context("usage: skyber-a1-peer [--lan] RUN_DIRECTORY")?;
-    let lan = first == "--lan";
-    let directory = if lan {
-        args.next().context("missing run directory")?
-    } else {
-        first
-    };
+        .context("usage: skyber-a1-peer [--lan] [--capture] RUN_DIRECTORY")?;
     ensure!(args.next().is_none(), "unexpected peer arguments");
-    run(&PathBuf::from(directory), lan).await
+    run(&PathBuf::from(directory), lan, live).await
 }
