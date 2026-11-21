@@ -1,7 +1,7 @@
 # A2-0 Wi-Fi runbook
 
 Use two physical Windows PCs on the same trusted Wi-Fi LAN. On the second
-PC, attach Ubuntu 24.04 x86-64 VirtualBox adapter 1 in Bridged mode to the
+PC, attach Ubuntu 26.04.1 LTS x86-64 VirtualBox adapter 1 in Bridged mode to the
 active Wi-Fi adapter. Read the guest address with `ip -4 -br address` and
 verify the route with `ip route get WINDOWS_IP`. On Windows, verify the
 Wi-Fi address and Private network profile. If the guest lacks a LAN

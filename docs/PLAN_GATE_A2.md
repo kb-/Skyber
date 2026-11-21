@@ -9,7 +9,7 @@
 Prove an actual bidirectional Kyber-based call across **two separate physical computers** on a genuine local area network:
 
 - **Peer A:** native Windows 11 on the Skyber development computer.
-- **Peer B:** Ubuntu 24.04 Desktop **guest in VirtualBox on a second physical Windows computer**.
+- **Peer B:** Ubuntu 26.04.1 LTS Desktop **guest in VirtualBox on a second physical Windows computer**.
 - The second Windows host is a hypervisor and device source; **the peer runs in Ubuntu**, not in the host Windows session.
 - The first milestone, **A2a**, uses the VM for functional LAN interoperability, physical-device integration where accessible, and instrumented end-to-end tests.
 - The second milestone, **A2b**, validates the remaining native Linux hardware/compositor/GPU behaviors on bare-metal Linux, before claiming that the **full original Gate A2 hardware acceptance** has passed.
@@ -43,7 +43,7 @@ Suggested starting configuration (adapt to the second PC's actual resources):
 
 | Setting | Starting point |
 | --- | --- |
-| Guest OS | Ubuntu 24.04 LTS Desktop, x86-64 |
+| Guest OS | Ubuntu 26.04.1 LTS Desktop, x86-64 |
 | VirtualBox | Currently supported 7.x release on Windows host |
 | CPU and RAM | 4 virtual CPUs; 8 GB guest RAM when host capacity permits |
 | Graphics | VMSVGA, 128 MB video memory, 3D acceleration enabled if stable |
@@ -118,7 +118,7 @@ Oracle references: [webcam passthrough and Extension Pack](https://docs.oracle.c
 
 ### A2b — Native Linux acceptance (deferred but still required)
 
-A separate **bare-metal Linux** test on a physical PC closes gaps masked by VirtualBox:
+A separate **bare-metal Ubuntu 26.04.1 LTS** test on a physical PC closes gaps masked by VirtualBox:
 
 - Native Linux GPU/renderer and hardware encode/decode path, where supported.
 - Native display/compositor behavior, camera/USB/audio stacks and actual resolution/frame-rate capabilities.
