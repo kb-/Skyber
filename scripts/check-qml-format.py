@@ -12,7 +12,11 @@ def main() -> int:
     for name in sys.argv[1:]:
         path = Path(name)
         result = subprocess.run(
-            ["qmlformat", str(path)], check=True, stdout=subprocess.PIPE, text=True, encoding="utf-8"
+            ["qmlformat", "--newline", "unix", str(path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
         )
         if result.stdout != path.read_text(encoding="utf-8"):
             print(f"QML formatting differs in {path}. Run qmlformat -i {path}.", file=sys.stderr)
