@@ -1,0 +1,27 @@
+[package]
+name = "skyber-media-kyber"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+a1-native = []
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+kymux.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+skyber-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "skyber-a1-peer"
+path = "src/bin/a1_peer.rs"
+required-features = ["a1-native"]
+
+[lints]
+workspace = true
