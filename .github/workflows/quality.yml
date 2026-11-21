@@ -1,0 +1,66 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '25 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+jobs:
+  rust:
+    if: github.event_name != 'schedule'
+    strategy:
+      matrix:
+        os: [windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo fmt --all -- --check
+      - run: cargo check --locked --workspace --all-targets
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo nextest run --locked --workspace
+      - run: cargo test --locked --workspace --doc
+
+  dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
+        with:
+          tool: cargo-deny@0.19.6,cargo-audit@0.22.1
+      - run: cargo deny --locked --features skyber_desktop_bridge/qt check
+      - run: cargo audit
+
+  qt:
+    if: github.event_name != 'schedule'
+    strategy:
+      matrix:
+        os: [windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+        if: runner.os == 'Windows'
+      - name: Install Qt Quick build requirements
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl-dev libxkbcommon-dev
+      - uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
+        with:
+          version: '6.8.3'
+          cache: true
+      - run: cmake -S apps/desktop -B build/desktop -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build/desktop
+      - run: cmake --build build/desktop --target all_qmllint
+      - run: python scripts/check-qml-format.py apps/desktop/Main.qml
+      - run: ctest --test-dir build/desktop --output-on-failure

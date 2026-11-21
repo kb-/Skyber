@@ -1,6 +1,6 @@
 # Testing strategy
 
-**Status:** Testing design; no test suites or CI jobs exist yet. **See also:** [QUALITY.md](QUALITY.md), [CODING_STYLE.md](CODING_STYLE.md), [PLAN_SKYBER.md](PLAN_SKYBER.md).
+**Status:** Gate A1 software tests and CI lanes exist. See the [run instructions](../README.md) and [Gate A1 results](research/GATE_A1_RESULTS.md). **See also:** [QUALITY.md](QUALITY.md), [CODING_STYLE.md](CODING_STYLE.md), [PLAN_SKYBER.md](PLAN_SKYBER.md).
 
 ## Principle: fast feedback, realistic validation
 

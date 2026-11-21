@@ -1,6 +1,7 @@
 # Code quality and toolchain policy
 
-**Status:** Proposed standards, not yet wired into a build or CI pipeline. Adopt incrementally alongside the work in [PLAN_SKYBER.md](PLAN_SKYBER.md).  
+**Status:** Gate A1 Rust, dependency, and Qt checks are wired into CI. See [Gate A1 results](research/GATE_A1_RESULTS.md) for locally executed checks. Adopt later tiers alongside [PLAN_SKYBER.md](PLAN_SKYBER.md).
+
 **Owner:** Skyber contributors. **Last reviewed:** 2026-11-21.
 
 ## Goals

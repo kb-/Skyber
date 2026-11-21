@@ -1,0 +1,33 @@
+name: Gate A1 software media
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-loopback:
+    runs-on: [self-hosted, Windows, X64, skyber-a1]
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Build pinned Windows codec dependencies in Ubuntu WSL2
+        run: wsl.exe --distribution Ubuntu -- bash -lc 'bash scripts/build-a1-native.sh ~/.cache/skyber-a1-0.29.0'
+      - name: Build and stage the GNU media peer
+        run: wsl.exe --distribution Ubuntu -- bash -lc 'bash scripts/build-a1-peer.sh ~/.cache/skyber-a1-0.29.0'
+      - uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+      - name: Verify the MSVC consumer of the MinGW codec DLL
+        run: |
+          cl.exe /nologo /W4 /WX /std:c++20 /EHsc /Fotarget/a1/msvc_probe.obj /Fetarget/a1/skyber-a1-msvc-probe.exe native/a1/msvc_probe.cpp
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & .\target\a1\skyber-a1-msvc-probe.exe .\target\a1\skyber_a1_codecs.dll
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & .\target\a1\skyber-a1-msvc-probe.exe .\target\a1\missing-skyber-codecs.dll
+          if ($LASTEXITCODE -ne 1) { throw 'Missing-DLL check did not return 1' }
+          exit 0
+      - name: Run the Windows two-process regression suite
+        run: py -3 scripts/test-a1.py target/a1/skyber-a1-peer.exe
