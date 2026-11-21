@@ -1,4 +1,4 @@
-//! Kyber protocol adapter for Skyber's Gate A1 loopback proof.
+//! Kyber protocol adapter for Skyber's synthetic media proofs.
 
 pub mod transport;
 

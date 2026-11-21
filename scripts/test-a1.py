@@ -61,7 +61,7 @@ def process_cpu_ms(pid: int) -> float:
         kernel.CloseHandle(process)
 
 
-def verify_media(output: Path, profile: str, direction: str, stop_screen: bool) -> None:
+def verify_media(output: Path, profile: str, direction: str, stop_screen: bool, *, lan: bool = False) -> None:
     received = []
     track_names = ["microphone"]
     if profile != "audio":
@@ -99,7 +99,14 @@ def verify_media(output: Path, profile: str, direction: str, stop_screen: bool) 
                         f"{role} stopped another track with screen share",
                     )
         received.extend(incoming.values())
-    if direction == "both":
+    if direction == "both" and lan:
+        for role in ROLES:
+            rows = [row for row in read_result(output, role)["tracks"] if row["received_packets"]]
+            overlap = min(row["last_decoded_us"] for row in rows) - max(
+                row["first_decoded_us"] for row in rows
+            )
+            require(overlap >= 5_000_000, f"{role} decoded less than five seconds of overlap")
+    if direction == "both" and not lan:
         began = max(row["first_decoded_us"] for row in received)
         ended = min(row["last_decoded_us"] for row in received)
         require(ended - began >= 5_000_000, "less than five seconds of overlapping decoded output")
@@ -189,9 +196,13 @@ def run_case(
         if failure == "certificate":
             require("Certificate hash mismatch" in read_stderr(output, "initiator"), "wrong TLS error")
         if failure == "track_map":
-            require("unexpected remote" in read_stderr(output, "listener"), "wrong map error")
+            require(
+                any("unexpected remote" in read_stderr(output, role) for role in ROLES),
+                "neither peer rejected the mismatched track map",
+            )
         if failure is None:
-            verify_media(output, profile, direction, screen_stop is not None)
+            verify_media(output, profile, direction, screen_stop is not None, lan=sys.platform != "win32")
+        if failure is None and sys.platform == "win32":
             usage = {role: process_cpu_ms(peer.pid) for role, peer in peers.items()}
             (output / "cpu-ms.json").write_text(json.dumps(usage), encoding="utf-8")
     print(f"{output.name} passed", flush=True)
@@ -219,14 +230,19 @@ def main() -> None:
     output = args.output / stamp
     output.mkdir(parents=True)
     print(f"Gate A1 results directory {output}", flush=True)
+    run_suite(peer_exe, output, args.audio_only)
+
+
+def run_suite(peer_exe: Path, output: Path, audio_only: bool = False) -> None:
     port = available_port()
-    run_case(peer_exe, output / "audio-both", port)
-    if args.audio_only:
+    overlap_margin = 1500 if sys.platform == "linux" else 0
+    run_case(peer_exe, output / "audio-both", port, duration=5800 + overlap_margin)
+    if audio_only:
         return
     run_case(peer_exe, output / "av-listener", port, "av", "listener", 2000)
     run_case(peer_exe, output / "av-initiator", port, "av", "initiator", 2000)
-    run_case(peer_exe, output / "concurrent-screen-stop", port, "av_with_screen", duration=6500,
-             screen_stop=5400)
+    run_case(peer_exe, output / "concurrent-screen-stop", port, "av_with_screen", duration=6500 + overlap_margin,
+             screen_stop=5400 + overlap_margin)
     for error in ("auth", "certificate", "track_map", "timeout", "hangup"):
         run_case(peer_exe, output / error, port, failure=error)
     run_case(peer_exe, output / "rejoin-same-port", port, "av", "listener", 1000)

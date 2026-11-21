@@ -61,3 +61,5 @@ cmake --build build/desktop --target all_qmllint
 python scripts/check-qml-format.py apps/desktop/Main.qml
 ctest --test-dir build/desktop --output-on-failure
 ```
+
+For the native Ubuntu build, two-host Wi-Fi suite, and guest SSH and desktop setup, see [Run Gate A2-0](docs/RUN_GATE_A2_0.md).

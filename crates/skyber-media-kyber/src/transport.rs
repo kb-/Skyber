@@ -1,4 +1,4 @@
-//! Loopback authentication and track registration for the pinned Kyber SDK.
+//! Authentication and track registration for the synthetic Kyber peers.
 
 use std::{net::SocketAddr, path::Path, time::Duration};
 
@@ -30,12 +30,50 @@ impl Role {
     }
 }
 
+/// A validated address for an explicitly enabled private IPv4 test.
+#[derive(Clone, Copy)]
+pub struct LanAddress(SocketAddr);
+
+impl LanAddress {
+    pub fn new(ip: std::net::Ipv4Addr, port: u16) -> Result<Self> {
+        ensure!(
+            ip.is_private() && port != 0,
+            "LAN requires private IPv4 and a nonzero port"
+        );
+        Ok(Self((ip, port).into()))
+    }
+}
+
+pub async fn listen_lan(
+    address: LanAddress,
+    certificate: &Path,
+    key: &Path,
+) -> Result<kynet::common::CommonServer> {
+    listen_at(address.0, certificate, key).await
+}
+
+pub async fn connect_lan(
+    address: LanAddress,
+    fingerprint: String,
+    secret: &str,
+) -> Result<kyproto::Connection> {
+    connect_to(address.0, fingerprint, secret).await
+}
+
 pub async fn listen(
     address: SocketAddr,
     certificate: &Path,
     key: &Path,
 ) -> Result<kynet::common::CommonServer> {
     ensure!(address.ip().is_loopback(), "A1 listener requires loopback");
+    listen_at(address, certificate, key).await
+}
+
+async fn listen_at(
+    address: SocketAddr,
+    certificate: &Path,
+    key: &Path,
+) -> Result<kynet::common::CommonServer> {
     let cert = kynet::cert::load_cert_from_pem_file(certificate).await?;
     let key = kynet::cert::load_private_key_from_pem_file(key).await?;
     let options = kynet::common::CommonServerOptions {
@@ -66,6 +104,14 @@ pub async fn connect(
     secret: &str,
 ) -> Result<kyproto::Connection> {
     ensure!(address.ip().is_loopback(), "A1 connector requires loopback");
+    connect_to(address, fingerprint, secret).await
+}
+
+async fn connect_to(
+    address: SocketAddr,
+    fingerprint: String,
+    secret: &str,
+) -> Result<kyproto::Connection> {
     let options = kynet::quinn::QuinnClientOptions {
         max_idle_timeout: Some(Duration::from_secs(10)),
         keep_alive_interval: None,
@@ -221,6 +267,16 @@ pub async fn register_tracks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_address_requires_specific_private_ipv4() {
+        for ip in ["0.0.0.0", "127.0.0.1", "192.0.2.1", "224.0.0.1"] {
+            assert!(LanAddress::new(ip.parse().unwrap(), 34829).is_err());
+        }
+        let private = "192.168.1.2".parse().unwrap();
+        assert!(LanAddress::new(private, 0).is_err());
+        assert!(LanAddress::new(private, 34829).is_ok());
+    }
 
     #[test]
     fn map_preserves_independent_tracks() -> Result<()> {

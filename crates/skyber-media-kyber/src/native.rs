@@ -1,4 +1,4 @@
-//! Owners for the proof-only software codec contexts built with MinGW.
+//! Owners for the native software codec contexts used by the synthetic peers.
 
 use std::{ffi::c_void, ptr::NonNull};
 
@@ -119,7 +119,7 @@ impl Decoder {
             return Err(CodecError::Oversize);
         }
         let mut pointer = std::ptr::null_mut();
-        // SAFETY: The configuration bytes are readable during this call and the DLL copies them.
+        // SAFETY: The configuration bytes are readable during this call and the native codec copies them.
         let code = unsafe {
             a1_decoder_open(
                 track as u32,
