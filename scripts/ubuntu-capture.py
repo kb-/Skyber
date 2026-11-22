@@ -245,8 +245,8 @@ def main() -> None:
     parser.add_argument("duration_ms", type=int)
     parser.add_argument("--device")
     args = parser.parse_args()
-    if not 500 <= args.duration_ms <= 15000:
-        parser.error("duration must be 500–15000 ms")
+    if not 500 <= args.duration_ms <= 900_000:
+        parser.error("duration must be between 500 and 900000 ms")
     if (args.kind == "screen") == (args.device is not None):
         parser.error("select a device for camera or microphone; screen uses the consent picker")
     Gst.init(None)

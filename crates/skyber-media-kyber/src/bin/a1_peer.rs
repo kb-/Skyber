@@ -22,6 +22,9 @@ use tokio::{
 const SETUP_TIMEOUT: Duration = Duration::from_secs(4);
 const PLAYBACK_DRAIN_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_RECEIVED_PACKETS: usize = 1000;
+const SUSTAINED_DURATION_MS: u64 = 900_000;
+// 15 minutes of 50 audio packets per second plus bounded headroom.
+const MAX_SUSTAINED_PACKETS: usize = 60_000;
 const AUDIO_RATE: u32 = 48_000;
 
 #[derive(Clone, Copy, Deserialize)]
@@ -70,6 +73,10 @@ struct Settings {
     profile: Profile,
     direction: Direction,
     duration_ms: u64,
+    #[serde(default)]
+    sustained: bool,
+    #[serde(default)]
+    wait_for_remote_screen: bool,
     screen_stop_ms: Option<u64>,
     capture: Option<DeviceCapture>,
     #[serde(default)]
@@ -123,8 +130,13 @@ impl Settings {
     fn load(directory: &Path) -> Result<Self> {
         let config: Self = serde_json::from_slice(&std::fs::read(directory.join("peer.json"))?)
             .context("invalid A1 run configuration")?;
+        let max_duration_ms = if config.sustained {
+            SUSTAINED_DURATION_MS
+        } else {
+            15_000
+        };
         ensure!(
-            config.port != 0 && (500..=15_000).contains(&config.duration_ms),
+            config.port != 0 && (500..=max_duration_ms).contains(&config.duration_ms),
             "invalid port or run duration"
         );
         ensure!(
@@ -163,6 +175,15 @@ impl Settings {
                 "invalid audio output selector for this platform"
             );
         }
+        ensure!(
+            !config.wait_for_remote_screen
+                || (matches!(config.profile, Profile::AvWithScreen)
+                    && matches!(config.direction, Direction::Both)
+                    && config.role == Role::Listener
+                    && config.capture.is_some()
+                    && config.capture_wait_ms > 0),
+            "waiting for remote screen requires a bidirectional live screen listener"
+        );
         Ok(config)
     }
 }
@@ -701,6 +722,7 @@ async fn publish(
     duration_ms: u64,
     input: Input,
     screen_ready: Option<watch::Sender<bool>>,
+    remote_screen_ready: Option<watch::Receiver<bool>>,
     origin: Instant,
 ) -> Result<Observed> {
     let mut protocol = endpoint.ready().await?;
@@ -718,6 +740,10 @@ async fn publish(
                 timing.transport_send_start_us = Some(elapsed_micros(origin)?);
                 protocol.send(packet.packet).await?;
                 timing.transport_send_end_us = Some(elapsed_micros(origin)?);
+                ensure!(
+                    timings.len() < MAX_SUSTAINED_PACKETS,
+                    "excess published media data"
+                );
                 timings.push(timing);
             } else {
                 protocol.send(packet.packet).await?;
@@ -729,6 +755,9 @@ async fn publish(
         if matches!(input, Input::Synthetic) {
             Ok(())
         } else {
+            if let (Input::ScreenPicker, Some(mut ready)) = (&input, remote_screen_ready) {
+                ready.wait_for(|ready| *ready).await?;
+            }
             if let (Input::Device(_), Some(ready)) = (&input, &screen_ready) {
                 let mut signal = ready.subscribe();
                 signal.wait_for(|ready| *ready).await?;
@@ -803,6 +832,7 @@ async fn present(
         process::Command,
     };
 
+    let mut first_packet = Some(rx.recv().await.context("playback had no decoded output")?);
     let name = if cfg!(windows) {
         "skyber-windows-playback.exe"
     } else {
@@ -841,8 +871,13 @@ async fn present(
         let expected_track = track.label();
         while let Some(line) = lines.next_line().await? {
             if let Some(event) = parse_video_presentation_event(&line)? {
+                ensure!(
+                    video_events.len() < MAX_SUSTAINED_PACKETS,
+                    "excess video presentation events"
+                );
                 video_events.push(event);
             } else if let Some(event) = parse_audio_drain_event(&line)? {
+                ensure!(audio_events.is_empty(), "duplicate audio drain event");
                 audio_events.push(event);
             } else if let Some(count) = parse_video_superseded_event(&line, expected_track)? {
                 ensure!(
@@ -858,7 +893,10 @@ async fn present(
     let mut delivered = 0;
     let mut dismissed = false;
     let mut timings = Vec::new();
-    while let Some(packet) = rx.recv().await {
+    while let Some(packet) = match first_packet.take() {
+        Some(packet) => Some(packet),
+        None => rx.recv().await,
+    } {
         if !dismissed {
             let mut timing = TimingSample {
                 packet_id_us: packet.packet_id_us,
@@ -1003,6 +1041,8 @@ async fn subscribe(
     origin: Instant,
     playback: bool,
     audio_output: Option<DeviceSelector>,
+    max_received_packets: usize,
+    remote_screen_ready: Option<watch::Sender<bool>>,
 ) -> Result<Observed> {
     let mut protocol = endpoint.ready().await?;
     let Some(types::AVPacket::Codec(params)) = protocol.recv().await? else {
@@ -1035,7 +1075,7 @@ async fn subscribe(
                 !packet.header.is_config
                     && !packet.payload.is_empty()
                     && packet.payload.len() <= MAX_PACKET
-                    && received < MAX_RECEIVED_PACKETS,
+                    && received < max_received_packets,
                 "invalid or excess media data"
             );
             let timing = TimingSample {
@@ -1046,6 +1086,9 @@ async fn subscribe(
             tx.send(ReceivedPacket { packet, timing }).await?;
             if received == 0 {
                 tokio::fs::write(&progress, b"receiving").await?;
+                if let Some(ready) = &remote_screen_ready {
+                    ready.send_replace(true);
+                }
             }
             received += 1;
         }
@@ -1192,6 +1235,9 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
                 .as_ref()
                 .filter(|cap| cap.screen)
                 .map(|_| watch::channel(false).0);
+            let remote_screen_ready = config
+                .wait_for_remote_screen
+                .then(|| watch::channel(false).0);
             for endpoint in endpoints.outbound.drain(..) {
                 let duration_ms = if endpoint.0 == Track::Screen {
                     config.screen_stop_ms.unwrap_or(config.duration_ms)
@@ -1201,20 +1247,45 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
                 let track = endpoint.0;
                 let input = config.input(track);
                 let ready = screen_ready.clone();
+                let remote_ready = remote_screen_ready.as_ref().map(watch::Sender::subscribe);
                 tasks.spawn(async move {
-                    publish(endpoint, source, duration_ms, input, ready, origin)
-                        .await
-                        .with_context(|| format!("publishing {}", track.label()))
+                    publish(
+                        endpoint,
+                        source,
+                        duration_ms,
+                        input,
+                        ready,
+                        remote_ready,
+                        origin,
+                    )
+                    .await
+                    .with_context(|| format!("publishing {}", track.label()))
                 });
             }
             for endpoint in endpoints.inbound.drain(..) {
                 let track = endpoint.0;
                 let progress = directory.join(format!("{}.receiving", track.label()));
                 let audio_output = config.audio_output.clone();
+                let remote_ready = (track == Track::Screen)
+                    .then(|| remote_screen_ready.clone())
+                    .flatten();
+                let max_received_packets = if config.sustained {
+                    MAX_SUSTAINED_PACKETS
+                } else {
+                    MAX_RECEIVED_PACKETS
+                };
                 tasks.spawn(async move {
-                    subscribe(endpoint, progress, origin, playback, audio_output)
-                        .await
-                        .with_context(|| format!("subscribing to {}", track.label()))
+                    subscribe(
+                        endpoint,
+                        progress,
+                        origin,
+                        playback,
+                        audio_output,
+                        max_received_packets,
+                        remote_ready,
+                    )
+                    .await
+                    .with_context(|| format!("subscribing to {}", track.label()))
                 });
             }
             let mut observations = Vec::new();

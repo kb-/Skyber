@@ -165,6 +165,60 @@ Logitech C922 reported 219 microphone packets and 71 camera frames. Media
 payloads remained in memory. This checks the new local binary pipe framing;
 it is not a hardware sensor timestamp or an end-to-end LAN latency sample.
 
+## Sustained test mode
+
+Set `"sustained": true` in both test peers' private `peer.json` files to
+allow a `duration_ms` of up to 900,000. Rebuild both peers and both capture
+helpers before using this option with live devices. Existing profiles
+keep the 15-second limit. The sustained mode limits incoming media to
+60,000 packets per track, retains at most that many per-track timing
+records, and keeps the same bounded media queues. It still emits the
+per-packet report at exit, so expect larger JSON files. The option is
+for a timed test call and does not change the supported network addresses.
+
+For a bidirectional live test, the listener can set
+`"wait_for_remote_screen": true` with a nonzero `capture_wait_ms`.
+The initiator picks a source first. The listener opens its picker when it
+receives the initiator's first screen packet. Playback helpers start
+when there is decoded output to present.
+
+A 15-minute synthetic rehearsal over a self-hosted OpenVPN tunnel on
+Wi-Fi matched all 45,000 microphone packets and 13,500 frames on each
+video track in both directions. Separate 12-second live calls sent
+camera, microphone, and a selected test window from each platform to
+the other, with matching counts. After Windows switched to 4G, a short
+synthetic call through the same VPN also decoded all three tracks in
+both directions. The tunnel carried the private test subnet only.
+
+### Live 4G run
+
+Windows switched to 4G while the Ubuntu 26.04.1 LTS guest stayed on its
+original connection. Both used the self-hosted OpenVPN tunnel. The
+15-minute live call overlapped all six tracks for about 885 seconds
+after the two screen selections. All sent media packet IDs matched at
+the receivers. Both video tracks painted on each endpoint, and both
+audio helpers drained the decoded output.
+
+| Direction | Camera packets | Screen packets | Microphone packets | QUIC RTT p50/p95 at sender |
+| --- | ---: | ---: | ---: | ---: |
+| Windows to Ubuntu | 9,325 | 13,254 | 36,554 | 9.32 / 12.11 ms |
+| Ubuntu to Windows | 13,503 | 13,501 | 14,115 | 9.49 / 12.94 ms |
+
+The connection reported 2,527 lost QUIC packets at Windows and 1,173 at
+Ubuntu, while all reliable media packet IDs still arrived. The operator
+reported low perceived video latency in both directions. Physical
+capture-to-display delay was not measured.
+
+Audio continuity remains open. The expected 900-second output at 48 kHz
+is about 43.2 million stereo sample frames per direction, before codec
+priming. Ubuntu drained 35,091,528 frames from Windows and Windows
+drained 13,550,088 frames from Ubuntu. The largest microphone helper
+timestamp gaps were 1.35 seconds on Windows and 2.10 seconds on Ubuntu.
+The packet match rules out missing delivered audio packets as an
+explanation for the shortfall. Capture stalls and pipeline backpressure
+still need to be distinguished. The local timing and resource reports
+are under `target/skyber-openvpn/`.
+
 ## Limits and next measurements
 
 These measurements describe application boundaries. They do not
