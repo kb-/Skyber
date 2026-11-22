@@ -54,6 +54,11 @@ For the desktop shell, put the Qt 6.8.3 kit's `bin` directory on `PATH` and
 use the corresponding compiler environment. Configure CMake with the Qt kit
 root on `CMAKE_PREFIX_PATH`.
 
+On Windows, use a short CMake binary-directory path when building from a
+deeply nested worktree. CXX-Qt generates Rust build outputs containing C++
+source files under that directory; long generated paths can exceed MSVC's
+path limit. A repository-root directory such as `b` is suitable.
+
 ```text
 cmake -S apps/desktop -B build/desktop -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build/desktop
