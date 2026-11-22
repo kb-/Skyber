@@ -130,6 +130,25 @@ Detailed execution and acceptance plan: [Gate A2 — two physical PCs with Ubunt
 
 ### Gate C — real-network calls
 
+#### Gate C-0 — direct Internet connectivity proof
+
+Start with a standalone authenticated probe over Kyber's pinned Quinn transport.
+It uses an out-of-band SHA-256 server-certificate pin and a fresh 32-byte
+per-run token. The exchange is a fixed-size, versioned synthetic message, with
+strict connection, authentication, exchange, and shutdown deadlines. Default
+addresses are loopback; every non-loopback bind or connection requires an
+explicit `--internet` option. The listener accepts one peer and never creates a
+Kyber media decoder or uses the peer-sized `DataPacket` parser.
+
+Prove IPv4 and IPv6 loopback first, then direct public IPv4 and IPv6 where
+available. Record whether the path succeeds through the home router's
+temporary source-scoped UDP forward and host firewall rule. Remove temporary
+network rules after the test. Do not interpret this synthetic exchange as a
+media, NAT-traversal, relay, or production identity proof. See
+[Gate C-0 probe design and results](ADR/GATE_C_0_PUBLIC_CONNECTIVITY_PROBE.md).
+
+#### Gate C-1 — path discovery and fallback
+
 1. Establish secure peer identity and invitation signaling. Attempt direct IP/IPv6 connectivity, then STUN candidate discovery / UDP hole punching / ICE-like path selection as needed.
 2. Evaluate a TURN-style UDP relay, raw encrypted UDP forwarding, or purpose-built Kyber-aware relay; do **not** assume WebRTC TURN integration is plug-and-play.
 3. Make relay security and authentication explicit; test residential NAT, symmetric NAT, UDP-blocked workplace networks, and disconnect/reconnect.

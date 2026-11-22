@@ -11,12 +11,15 @@ a1-native = ["tokio/process", "tokio/io-util"]
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+getrandom.workspace = true
 kymux.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 skyber-core.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [[bin]]
 name = "skyber-a1-peer"

@@ -1132,12 +1132,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "getrandom 0.4.3",
  "kymux",
  "serde",
  "serde_json",
  "skyber-core",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
