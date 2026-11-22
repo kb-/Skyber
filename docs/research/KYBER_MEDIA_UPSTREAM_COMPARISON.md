@@ -68,6 +68,14 @@ Windows runtime smoke results: `ffmpeg.exe -version` and `ffprobe.exe -version` 
 
 The build is not a runtime media proof. Webcam or microphone capture, Kyber encode, Kymux media transfer, decode and visible presentation, hardware acceleration, A/V synchronization, latency and resource use remain unverified.
 
+### Windows device availability smoke (2026-11-22)
+
+The Windows host enumerated an `HD Webcam` and `Microphone Array (Intel Smart Sound Technology for Digital Microphones)` through Plug and Play. The existing Media Foundation A2 probe captured one webcam sample of 1,382,400 bytes and one microphone sample of 19,200 bytes. Its 15-second camera and microphone stream modes both exited successfully when their raw sample output was redirected away from the console. A separate FFmpeg DirectShow smoke identified the webcam as 1280x720 MJPEG at 30 fps and the microphone as 44.1 kHz stereo PCM, and captured both for two seconds.
+
+The webcam probe returned `0x80070005` when launched inside the restricted command sandbox, then succeeded when run outside it. This is an execution-permission limitation of that shell, not an absent or failed Windows device. These results validate host capture availability only. They do not exercise the pinned Kyber graph, Kymux, Kyber decoding or playback, or provide continuity, synchronization or performance measurements.
+
+A separate 10-second controlled localhost run of `scripts/test-a2-capture.py` used Windows camera and microphone device index `0` together. It passed the harness's authenticated Kyber round-trip check: the receiving peer decoded 109 camera frames and 487 microphone packets (467,208 decoded audio samples); transport reported zero lost packets and a 386 microsecond median loopback RTT. This exercises Skyber's A1/A2 comparison capture/codec path with the pinned Kymux transport, not Kyber's upstream `kyavservice`/VLC production graph. It did not verify visible video presentation or audible playback, and is not a WAN, continuity, synchronization, hardware-acceleration or performance acceptance result.
+
 Run `scripts/build-kyber-windows.ps1` from the Windows account that owns the Docker Desktop session. It checks Linux x86_64 engine access before creating or starting the builder. `scripts/build-kyber-windows.ps1 -Status` reports the existing persistent container and volume. If the sandboxed shell is denied access to Docker's Windows named pipe while the user session can reach it, invoke the script from that user PowerShell session. A build failure leaves the named volume, checkout, downloaded sources and compiler state available for retry.
 
 This is build infrastructure progress, not a Kyber media proof. Webcam and microphone capture, encoding, transport, decoding, visible presentation, hardware acceleration, A/V synchronization, latency and resource use remain unverified.
