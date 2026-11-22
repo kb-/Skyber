@@ -287,20 +287,13 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
             );
             send.write_all(&[SHUTDOWN_ACK]).await?;
             send.flush().await?;
+            raw.close(0, "Gate C-0 probe complete");
             Ok::<(), anyhow::Error>(())
         })
         .await
         .context("Gate C-0 shutdown timed out");
-        let close_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, raw.closed())
-            .await
-            .context("Gate C-0 shutdown timed out")
-            .map_err(|_| anyhow::anyhow!("Gate C-0 shutdown timed out"))
-            .and_then(|result| {
-                result.map_err(|_| anyhow::anyhow!("Gate C-0 peer shutdown failed"))
-            });
         exchange_result??;
         shutdown_result??;
-        close_result?;
         Ok::<(), anyhow::Error>(())
     })
     .await
