@@ -170,10 +170,14 @@ fn proof_message(role: u8, peers: AuthenticatedPeers, exporter: &[u8; 32]) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-    use skyber_signaling::{AuthenticatedPeers, PeerIdentity, RoomId};
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-    use super::proof_message;
+    use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+    use quinn::Endpoint;
+    use skyber_signaling::{AuthenticatedPeers, PeerIdentity, RoomId};
+    use tokio::time::timeout;
+
+    use super::{RoomAuthError, authenticate_room, proof_message};
 
     fn fixture() -> (AuthenticatedPeers, SigningKey, SigningKey, [u8; 32]) {
         let inviter = SigningKey::from_bytes(&[11; 32]);
@@ -239,5 +243,98 @@ mod tests {
                 .verify(&impersonated_proof, &impersonated_signature)
                 .is_err()
         );
+    }
+
+    async fn quic_pair() -> anyhow::Result<(quinn::Connection, quinn::Connection)> {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let certificate_der = certificate.cert.der().clone();
+        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der()),
+        );
+        let server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate_der.clone()], private_key)?;
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_tls)?,
+        ));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate_der)?;
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)?,
+        ));
+        let server_endpoint =
+            Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        let server_address = server_endpoint.local_addr()?;
+        let mut client_endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        client_endpoint.set_default_client_config(client_config);
+        let client_connecting = client_endpoint.connect(server_address, "localhost")?;
+        let server_connecting = async {
+            server_endpoint
+                .accept()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("server endpoint closed"))?
+                .await
+                .map_err(anyhow::Error::from)
+        };
+        let (client, server) = timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                async { client_connecting.await.map_err(anyhow::Error::from) },
+                server_connecting,
+            )
+        })
+        .await??;
+        Ok((client, server))
+    }
+
+    #[tokio::test]
+    async fn quic_room_mismatch_rejects_both_peers() -> anyhow::Result<()> {
+        let (client, server) = quic_pair().await?;
+        let (client_peers, inviter, invitee, _) = fixture();
+        let server_peers = AuthenticatedPeers {
+            room: RoomId::from_bytes([8; 16]),
+            ..client_peers
+        };
+        let (client_result, server_result) = tokio::join!(
+            authenticate_room(client, client_peers, &inviter),
+            authenticate_room(server, server_peers, &invitee),
+        );
+        assert!(client_result.is_err());
+        assert!(matches!(server_result, Err(RoomAuthError::InvalidProof)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quic_wrong_local_identity_is_rejected_and_closes_peer() -> anyhow::Result<()> {
+        let (client, server) = quic_pair().await?;
+        let (peers, inviter, _, _) = fixture();
+        let impersonator = SigningKey::from_bytes(&[44; 32]);
+        let (client_result, server_result) = tokio::join!(
+            authenticate_room(client, peers, &inviter),
+            authenticate_room(server, peers, &impersonator),
+        );
+        assert!(matches!(
+            server_result,
+            Err(RoomAuthError::LocalIdentityMismatch)
+        ));
+        assert!(client_result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn each_quic_reconnect_authenticates_a_new_connection() -> anyhow::Result<()> {
+        let (peers, inviter, invitee, _) = fixture();
+        for _ in 0..2 {
+            let (client, server) = quic_pair().await?;
+            let (client_result, server_result) = tokio::join!(
+                authenticate_room(client, peers, &inviter),
+                authenticate_room(server, peers, &invitee),
+            );
+            client_result?;
+            server_result?;
+        }
+        Ok(())
     }
 }
