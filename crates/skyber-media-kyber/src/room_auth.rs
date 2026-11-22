@@ -48,6 +48,10 @@ pub enum RoomAuthError {
 pub struct AuthenticatedRoomConnection(Connection);
 
 impl AuthenticatedRoomConnection {
+    pub fn as_inner(&self) -> &Connection {
+        &self.0
+    }
+
     pub fn into_inner(self) -> Connection {
         self.0
     }

@@ -23,6 +23,7 @@ skyber-signaling = { path = "../skyber-signaling" }
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 zeroize.workspace = true
 webrtc-ice.workspace = true
 webrtc-util.workspace = true
@@ -30,7 +31,7 @@ webrtc-util.workspace = true
 [dev-dependencies]
 rcgen = "=0.14.10"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-tungstenite = "=0.30.0"
+tokio-rustls.workspace = true
 futures-util = "=0.3.34"
 
 [[bin]]

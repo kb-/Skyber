@@ -127,6 +127,12 @@ where
     pub const fn room(&self) -> RoomId {
         self.room
     }
+
+    /// Transfer the already authenticated relay WebSocket into a datagram
+    /// transport adapter such as Quinn's `AsyncUdpSocket` bridge.
+    pub fn into_websocket(self) -> S {
+        self.websocket
+    }
 }
 
 impl<S> SignalClient<S>

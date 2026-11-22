@@ -13,8 +13,11 @@ use std::{
     task::{Context, Poll},
 };
 
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use quinn::{AsyncUdpSocket, UdpPoller};
+use skyber_signaling::RelayClient;
 use tokio::sync::{mpsc, watch};
+use tokio_tungstenite::{tungstenite::Error as WebSocketError, tungstenite::Message};
 use webrtc_util::conn::Conn;
 
 const PACKET_CAPACITY: usize = 64;
@@ -104,11 +107,16 @@ impl IceQuinnSocket {
             shutdown,
         }))
     }
+
+    /// Stop background ICE bridge tasks and close their bounded queues.
+    pub fn close(&self) {
+        self.shutdown.send_replace(true);
+    }
 }
 
 impl Drop for IceQuinnSocket {
     fn drop(&mut self) {
-        self.shutdown.send_replace(true);
+        self.close();
     }
 }
 
@@ -241,47 +249,243 @@ impl UdpPoller for IceWritePoller {
     }
 }
 
+/// Quinn's bounded UDP-socket adapter for an authenticated WSS relay tunnel.
+/// Each binary WebSocket message remains one QUIC datagram.
+pub struct RelayQuinnSocket {
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    outgoing: Arc<mpsc::Sender<Vec<u8>>>,
+    incoming: Mutex<mpsc::Receiver<Vec<u8>>>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl std::fmt::Debug for RelayQuinnSocket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayQuinnSocket")
+            .field("local_addr", &self.local_addr)
+            .field("remote_addr", &self.remote_addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RelayQuinnSocket {
+    /// Wrap a relay that has already passed `RelayClient::join` authentication.
+    pub fn from_authenticated_relay<S>(
+        relay: RelayClient<S>,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> Arc<Self>
+    where
+        S: Sink<Message, Error = WebSocketError>
+            + Stream<Item = Result<Message, WebSocketError>>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        Self::new(relay.into_websocket(), local_addr, remote_addr)
+    }
+
+    /// Wrap a WebSocket stream. Callers should prefer `from_authenticated_relay`
+    /// so arbitrary unjoined WebSockets cannot be mistaken for the relay path.
+    pub fn new<S>(websocket: S, local_addr: SocketAddr, remote_addr: SocketAddr) -> Arc<Self>
+    where
+        S: Sink<Message, Error = WebSocketError>
+            + Stream<Item = Result<Message, WebSocketError>>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let (mut sink, mut stream) = websocket.split();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(PACKET_CAPACITY);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(PACKET_CAPACITY);
+        let (shutdown, _) = watch::channel(false);
+
+        let writer_shutdown = shutdown.clone();
+        let mut writer_cancel = shutdown.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = writer_cancel.changed() => break,
+                    packet = outgoing_rx.recv() => match packet {
+                        Some(packet) if !packet.is_empty() && packet.len() <= MAX_PACKET_SIZE => {
+                            if sink.send(Message::Binary(packet.into())).await.is_err() { break; }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            let _ = sink.close().await;
+            writer_shutdown.send_replace(true);
+        });
+
+        let reader_shutdown = shutdown.clone();
+        let mut reader_cancel = shutdown.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let message = tokio::select! {
+                    _ = reader_cancel.changed() => break,
+                    message = stream.next() => message,
+                };
+                match message {
+                    Some(Ok(Message::Binary(packet)))
+                        if !packet.is_empty() && packet.len() <= MAX_PACKET_SIZE =>
+                    {
+                        tokio::select! {
+                            _ = reader_cancel.changed() => break,
+                            sent = incoming_tx.send(packet.to_vec()) => if sent.is_err() { break; },
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            reader_shutdown.send_replace(true);
+        });
+
+        Arc::new(Self {
+            local_addr,
+            remote_addr,
+            outgoing: Arc::new(outgoing_tx),
+            incoming: Mutex::new(incoming_rx),
+            shutdown,
+        })
+    }
+
+    /// Stop the relay bridge tasks. Use this after closing its Quinn endpoint.
+    pub fn close(&self) {
+        self.shutdown.send_replace(true);
+    }
+}
+
+impl Drop for RelayQuinnSocket {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl AsyncUdpSocket for RelayQuinnSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Box::pin(IceWritePoller {
+            sender: Arc::clone(&self.outgoing),
+            reserve: Mutex::new(None),
+        })
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        if transmit.destination != self.remote_addr
+            || transmit.segment_size.is_some()
+            || transmit.contents.is_empty()
+            || transmit.contents.len() > MAX_PACKET_SIZE
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid QUIC datagram for WebSocket relay",
+            ));
+        }
+        self.outgoing
+            .try_send(transmit.contents.to_vec())
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "WebSocket send queue is full")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "WebSocket relay is closed")
+                }
+            })
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let (Some(buffer), Some(metadata)) = (bufs.first_mut(), meta.first_mut()) else {
+            return Poll::Ready(Ok(0));
+        };
+        let mut incoming = match self.incoming.lock() {
+            Ok(incoming) => incoming,
+            Err(_) => {
+                return Poll::Ready(Err(io::Error::other("WebSocket receive queue poisoned")));
+            }
+        };
+        match incoming.poll_recv(cx) {
+            Poll::Ready(Some(packet)) if packet.len() <= buffer.len() => {
+                buffer[..packet.len()].copy_from_slice(&packet);
+                *metadata = quinn::udp::RecvMeta {
+                    addr: self.remote_addr,
+                    len: packet.len(),
+                    stride: packet.len(),
+                    ecn: None,
+                    dst_ip: Some(self.local_addr.ip()),
+                };
+                Poll::Ready(Ok(1))
+            }
+            Poll::Ready(Some(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket datagram exceeds Quinn receive buffer",
+            ))),
+            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "WebSocket relay closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{IpAddr, SocketAddr},
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+    use super::MAX_PACKET_SIZE;
+    use crate::ice_session::{IceCandidateEvent, IceRole, IceSession, RemoteIceCredentials};
+    use crate::room_auth::authenticate_room;
+    use crate::transport::{
+        AudioMode, Role, TrackProtocols, VideoMode, register_tracks_with_protocols,
+    };
     use anyhow::{Context, Result, ensure};
+    use ed25519_dalek::SigningKey;
     use futures_util::{SinkExt, StreamExt};
-    use quinn::{AsyncUdpSocket, EndpointConfig, TokioRuntime, UdpPoller};
+    use quinn::{AsyncUdpSocket, EndpointConfig, TokioRuntime};
+    use skyber_signaling::{AuthenticatedPeers, PeerIdentity, RoomId};
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
         net::TcpListener,
-        sync::mpsc,
         task::JoinHandle,
     };
     use tokio_tungstenite::{
         WebSocketStream, accept_async_with_config, connect_async_with_config, tungstenite::Message,
     };
-    use webrtc_ice::{
-        agent::{Agent, agent_config::AgentConfig},
-        candidate::{Candidate, CandidateType, candidate_base::unmarshal_candidate},
-        mdns::MulticastDnsMode,
-        network_type::NetworkType,
-    };
-
-    use super::{IceQuinnSocket, MAX_PACKET_SIZE, PACKET_CAPACITY};
-    use crate::room_auth::authenticate_room;
-    use crate::transport::{
-        AudioMode, Role, TrackProtocols, VideoMode, register_tracks_with_protocols,
-    };
-    use ed25519_dalek::SigningKey;
-    use skyber_signaling::{AuthenticatedPeers, PeerIdentity, RoomId};
-    use std::{io::IoSliceMut, task::Poll};
 
     #[tokio::test]
     async fn nominated_ice_pair_carries_pinned_kyber_quic() -> Result<()> {
-        let (client_ice, server_ice) = ice_pair().await?;
-        let client_socket = IceQuinnSocket::new(client_ice)?;
-        let server_socket = IceQuinnSocket::new(server_ice)?;
+        let mut client_ice = IceSession::new(&[]).await?;
+        let mut server_ice = IceSession::new(&[]).await?;
+        client_ice.gather()?;
+        server_ice.gather()?;
+        let client_candidate = receive_candidate(&mut client_ice).await?;
+        let server_candidate = receive_candidate(&mut server_ice).await?;
+        client_ice.add_remote_candidate(&server_candidate)?;
+        server_ice.add_remote_candidate(&client_candidate)?;
+        let client_remote = RemoteIceCredentials::new(
+            server_ice.local_credentials().ufrag().to_owned(),
+            server_ice.local_credentials().password().to_owned(),
+        )?;
+        let server_remote = RemoteIceCredentials::new(
+            client_ice.local_credentials().ufrag().to_owned(),
+            client_ice.local_credentials().password().to_owned(),
+        )?;
+        let (client_ice, server_ice) = tokio::try_join!(
+            client_ice.connect(IceRole::Controlling, client_remote),
+            server_ice.connect(IceRole::Controlled, server_remote),
+        )?;
+        let client_socket = client_ice.quinn_socket();
+        let server_socket = server_ice.quinn_socket();
         let server_addr = server_socket.local_addr()?;
 
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
@@ -554,8 +758,8 @@ mod tests {
     async fn websocket_pair(
         drop_first_packet_each_way: bool,
     ) -> Result<(
-        Arc<WebSocketQuinnSocket>,
-        Arc<WebSocketQuinnSocket>,
+        Arc<super::RelayQuinnSocket>,
+        Arc<super::RelayQuinnSocket>,
         JoinHandle<()>,
     )> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -591,8 +795,8 @@ mod tests {
         let client_addr = SocketAddr::from(([127, 0, 0, 1], 52001));
         let server_addr = SocketAddr::from(([127, 0, 0, 1], 52002));
         Ok((
-            WebSocketQuinnSocket::new(first, client_addr, server_addr),
-            WebSocketQuinnSocket::new(second, server_addr, client_addr),
+            super::RelayQuinnSocket::new(first, client_addr, server_addr),
+            super::RelayQuinnSocket::new(second, server_addr, client_addr),
             relay,
         ))
     }
@@ -646,212 +850,16 @@ mod tests {
         let _ = second_sink.close().await;
     }
 
-    struct WebSocketQuinnSocket {
-        local_addr: SocketAddr,
-        remote_addr: SocketAddr,
-        outgoing: Arc<mpsc::Sender<Vec<u8>>>,
-        incoming: Mutex<mpsc::Receiver<Vec<u8>>>,
-    }
-
-    impl std::fmt::Debug for WebSocketQuinnSocket {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter
-                .debug_struct("WebSocketQuinnSocket")
-                .finish_non_exhaustive()
-        }
-    }
-
-    impl WebSocketQuinnSocket {
-        fn new<S>(
-            websocket: WebSocketStream<S>,
-            local_addr: SocketAddr,
-            remote_addr: SocketAddr,
-        ) -> Arc<Self>
-        where
-            S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        {
-            let (mut sink, mut stream) = websocket.split();
-            let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(PACKET_CAPACITY);
-            let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(PACKET_CAPACITY);
-            tokio::spawn(async move {
-                while let Some(packet) = outgoing_rx.recv().await {
-                    if packet.is_empty()
-                        || packet.len() > MAX_PACKET_SIZE
-                        || sink.send(Message::Binary(packet.into())).await.is_err()
-                    {
-                        break;
-                    }
+    async fn receive_candidate(session: &mut IceSession) -> Result<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            match session.next_candidate().await? {
+                IceCandidateEvent::Candidate(candidate) => Ok(candidate),
+                IceCandidateEvent::GatheringComplete => {
+                    anyhow::bail!("ICE candidate gathering completed without a candidate")
                 }
-            });
-            tokio::spawn(async move {
-                while let Some(message) = stream.next().await {
-                    match message {
-                        Ok(Message::Binary(packet))
-                            if !packet.is_empty() && packet.len() <= MAX_PACKET_SIZE =>
-                        {
-                            if incoming_tx.send(packet.to_vec()).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-            });
-            Arc::new(Self {
-                local_addr,
-                remote_addr,
-                outgoing: Arc::new(outgoing_tx),
-                incoming: Mutex::new(incoming_rx),
-            })
-        }
-    }
-
-    impl AsyncUdpSocket for WebSocketQuinnSocket {
-        fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn UdpPoller>> {
-            Box::pin(super::IceWritePoller {
-                sender: Arc::clone(&self.outgoing),
-                reserve: Mutex::new(None),
-            })
-        }
-
-        fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
-            if transmit.destination != self.remote_addr
-                || transmit.segment_size.is_some()
-                || transmit.contents.is_empty()
-                || transmit.contents.len() > MAX_PACKET_SIZE
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "invalid QUIC datagram for WebSocket relay",
-                ));
             }
-            self.outgoing
-                .try_send(transmit.contents.to_vec())
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        "WebSocket send queue full",
-                    ),
-                    mpsc::error::TrySendError::Closed(_) => std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "WebSocket relay closed",
-                    ),
-                })
-        }
-
-        fn poll_recv(
-            &self,
-            cx: &mut std::task::Context<'_>,
-            bufs: &mut [IoSliceMut<'_>],
-            meta: &mut [quinn::udp::RecvMeta],
-        ) -> Poll<std::io::Result<usize>> {
-            let (Some(buffer), Some(metadata)) = (bufs.first_mut(), meta.first_mut()) else {
-                return Poll::Ready(Ok(0));
-            };
-            let mut incoming = match self.incoming.lock() {
-                Ok(receiver) => receiver,
-                Err(_) => {
-                    return Poll::Ready(Err(std::io::Error::other(
-                        "WebSocket receive queue poisoned",
-                    )));
-                }
-            };
-            match incoming.poll_recv(cx) {
-                Poll::Ready(Some(packet)) if packet.len() <= buffer.len() => {
-                    buffer[..packet.len()].copy_from_slice(&packet);
-                    *metadata = quinn::udp::RecvMeta {
-                        addr: self.remote_addr,
-                        len: packet.len(),
-                        stride: packet.len(),
-                        ecn: None,
-                        dst_ip: Some(self.local_addr.ip()),
-                    };
-                    Poll::Ready(Ok(1))
-                }
-                Poll::Ready(Some(_)) => Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "WebSocket datagram exceeds Quinn receive buffer",
-                ))),
-                Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "WebSocket relay closed",
-                ))),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-
-        fn local_addr(&self) -> std::io::Result<SocketAddr> {
-            Ok(self.local_addr)
-        }
-    }
-
-    async fn ice_pair() -> Result<(
-        Arc<impl webrtc_util::conn::Conn + Send + Sync>,
-        Arc<impl webrtc_util::conn::Conn + Send + Sync>,
-    )> {
-        let client = Arc::new(Agent::new(ice_config()).await?);
-        let server = Arc::new(Agent::new(ice_config()).await?);
-        let (client_candidates_tx, mut client_candidates_rx) = mpsc::channel::<String>(1);
-        let (server_candidates_tx, mut server_candidates_rx) = mpsc::channel::<String>(1);
-        client.on_candidate(Box::new(move |candidate| {
-            let tx = client_candidates_tx.clone();
-            Box::pin(async move {
-                if let Some(candidate) = candidate {
-                    let _ = tx.send(candidate.marshal()).await;
-                }
-            })
-        }));
-        server.on_candidate(Box::new(move |candidate| {
-            let tx = server_candidates_tx.clone();
-            Box::pin(async move {
-                if let Some(candidate) = candidate {
-                    let _ = tx.send(candidate.marshal()).await;
-                }
-            })
-        }));
-
-        let (client_ufrag, client_password) = client.get_local_user_credentials().await;
-        let (server_ufrag, server_password) = server.get_local_user_credentials().await;
-        client.gather_candidates()?;
-        server.gather_candidates()?;
-        let client_candidate = receive_candidate(&mut client_candidates_rx).await?;
-        let server_candidate = receive_candidate(&mut server_candidates_rx).await?;
-        let client_remote: Arc<dyn Candidate + Send + Sync> =
-            Arc::new(unmarshal_candidate(&server_candidate)?);
-        let server_remote: Arc<dyn Candidate + Send + Sync> =
-            Arc::new(unmarshal_candidate(&client_candidate)?);
-        client.add_remote_candidate(&client_remote)?;
-        server.add_remote_candidate(&server_remote)?;
-
-        let (_client_cancel_tx, client_cancel_rx) = mpsc::channel(1);
-        let (_server_cancel_tx, server_cancel_rx) = mpsc::channel(1);
-        let (client_connection, server_connection) =
-            tokio::time::timeout(Duration::from_secs(10), async {
-                tokio::try_join!(
-                    client.dial(client_cancel_rx, server_ufrag, server_password),
-                    server.accept(server_cancel_rx, client_ufrag, client_password),
-                )
-            })
-            .await
-            .context("ICE connectivity checks timed out")??;
-        Ok((client_connection, server_connection))
-    }
-
-    fn ice_config() -> AgentConfig {
-        AgentConfig {
-            network_types: vec![NetworkType::Udp4],
-            candidate_types: vec![CandidateType::Host],
-            multicast_dns_mode: MulticastDnsMode::Disabled,
-            include_loopback: true,
-            ip_filter: Arc::new(Some(Box::new(|ip: IpAddr| ip.is_loopback()))),
-            ..Default::default()
-        }
-    }
-
-    async fn receive_candidate(receiver: &mut mpsc::Receiver<String>) -> Result<String> {
-        tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-            .await
-            .context("ICE host candidate gathering timed out")?
-            .context("ICE candidate gathering ended without a candidate")
+        })
+        .await
+        .context("ICE host candidate gathering timed out")?
     }
 }
