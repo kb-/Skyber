@@ -6,6 +6,7 @@ import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import secrets
 import socket
@@ -53,12 +54,205 @@ def process_cpu_ms(pid: int) -> float:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
         created, exited, system, user = [wintypes.FILETIME() for _ in range(4)]
-        if not kernel.GetProcessTimes(process, created, exited, system, user):
+        if not kernel.GetProcessTimes(
+            process, *(ctypes.byref(value) for value in (created, exited, system, user))
+        ):
             raise ctypes.WinError(ctypes.get_last_error())
         ticks = sum((t.dwHighDateTime << 32) | t.dwLowDateTime for t in (system, user))
         return ticks / 10_000
     finally:
         kernel.CloseHandle(process)
+
+
+def process_resource_sample(pid: int) -> tuple[int, int, int]:
+    """Return process CPU microseconds, resident bytes, and peak resident bytes."""
+    if sys.platform == "win32":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+            ctypes.POINTER(wintypes.FILETIME)
+        ] * 4
+        kernel.GetProcessTimes.restype = wintypes.BOOL
+
+        class ProcessMemoryCountersEx(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(ProcessMemoryCountersEx), wintypes.DWORD
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        process = kernel.OpenProcess(0x1000 | 0x0010, False, pid)
+        if not process:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            created, exited, system, user = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel.GetProcessTimes(
+                process, *(ctypes.byref(value) for value in (created, exited, system, user))
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            ticks = sum((t.dwHighDateTime << 32) | t.dwLowDateTime for t in (system, user))
+            counters = ProcessMemoryCountersEx()
+            counters.cb = ctypes.sizeof(counters)
+            if not psapi.GetProcessMemoryInfo(process, ctypes.byref(counters), counters.cb):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return ticks // 10, counters.WorkingSetSize, counters.PeakWorkingSetSize
+        finally:
+            kernel.CloseHandle(process)
+
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    fields = stat[stat.rfind(")") + 2:].split()
+    ticks = int(fields[11]) + int(fields[12])  # utime and stime, fields 14 and 15.
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    memory = {line.split(":", 1)[0]: int(line.split()[1]) * 1024
+              for line in status.splitlines()
+              if line.startswith(("VmRSS:", "VmHWM:"))}
+    return ticks * 1_000_000 // ticks_per_second, memory["VmRSS"], memory["VmHWM"]
+
+
+def monitor_processes(
+    processes: dict[str, subprocess.Popen[bytes]], timeout: float, interval: float = 0.5,
+) -> dict[str, list[dict[str, int]]]:
+    """Wait for peer processes while sampling their local CPU and memory use."""
+    origin = time.monotonic_ns()
+    samples: dict[str, list[dict[str, int]]] = {role: [] for role in processes}
+    observed_peak_resident = {role: 0 for role in processes}
+    next_sample = 0.0
+    deadline = time.monotonic() + timeout
+    while any(peer.poll() is None for peer in processes.values()):
+        elapsed_us = (time.monotonic_ns() - origin) // 1000
+        if elapsed_us / 1_000_000 >= next_sample:
+            for role, peer in processes.items():
+                if peer.poll() is not None:
+                    continue
+                try:
+                    cpu_us, resident_bytes, peak_resident_bytes = process_resource_sample(peer.pid)
+                except (OSError, KeyError, ValueError):
+                    continue
+                observed_peak_resident[role] = max(
+                    observed_peak_resident[role], resident_bytes, peak_resident_bytes
+                )
+                samples[role].append({
+                    "test_runner_timestamp_us": elapsed_us,
+                    "process_cpu_us": cpu_us,
+                    "resident_bytes": resident_bytes,
+                    "peak_resident_bytes": observed_peak_resident[role],
+                })
+            next_sample += interval
+        if time.monotonic() >= deadline:
+            active = next(role for role, peer in processes.items() if peer.poll() is None)
+            raise subprocess.TimeoutExpired(processes[active].args, timeout)
+        time.sleep(0.05)
+    return samples
+
+
+def verify_resource_samples(samples: dict[str, list[dict[str, int]]]) -> None:
+    for role in ROLES:
+        rows = samples.get(role, [])
+        require(bool(rows), f"{role} has no process resource samples")
+        require(all(left["test_runner_timestamp_us"] < right["test_runner_timestamp_us"]
+                    and left["process_cpu_us"] <= right["process_cpu_us"]
+                    and left["peak_resident_bytes"] <= right["peak_resident_bytes"]
+                    for left, right in zip(rows, rows[1:])),
+                f"{role} process resource samples are not monotonic")
+        require(all(row["resident_bytes"] > 0
+                    and row["peak_resident_bytes"] >= row["resident_bytes"]
+                    and row["process_cpu_us"] >= 0 for row in rows),
+                f"{role} process resource sample is invalid")
+
+
+def verify_timing(row: dict) -> None:
+    samples = row.get("timings")
+    require(isinstance(samples, list), "missing per-packet timing samples")
+    summary = row.get("timing_summary", {})
+    require(summary.get("clock_domain") == "peer_monotonic_us_since_media_start",
+            "timing clock domain is missing or changed")
+    if row["sent_packets"]:
+        require(len(samples) == row["sent_packets"], "published timing sample count changed")
+        require(summary["encode_us"]["samples"] == row["sent_packets"]
+                and summary["transport_send_us"]["samples"] == row["sent_packets"],
+                "published stage sample count changed")
+        require(summary["encode_queue_depth_max"] <= 2,
+                "encoded packet queue exceeded its bound")
+        helper_times = [sample.get("capture_helper_timestamp_us") for sample in samples]
+        if any(timestamp is not None for timestamp in helper_times):
+            require(all(isinstance(timestamp, int) and timestamp >= 0 for timestamp in helper_times),
+                    "capture helper timestamp is missing or invalid")
+            require(all(left < right for left, right in zip(helper_times, helper_times[1:])),
+                    "capture helper timestamps are not increasing")
+        for sample in samples:
+            require(all(isinstance(sample.get(name), int) for name in (
+                "packet_id_us", "source_ready_us", "encode_start_us", "encode_end_us",
+                "transport_send_start_us", "transport_send_end_us")),
+                "published packet is missing a timing boundary")
+            require(sample["source_ready_us"] <= sample["encode_start_us"]
+                    <= sample["encode_end_us"]
+                    <= sample["transport_send_start_us"]
+                    <= sample["transport_send_end_us"],
+                    "published timing boundaries are out of order")
+    if row["received_packets"]:
+        require(len(samples) == row["received_packets"], "received timing sample count changed")
+        require(summary["decode_us"]["samples"] == row["received_packets"],
+                "decoded stage sample count changed")
+        require(summary["playback_queue_depth_max"] <= 2,
+                "playback queue exceeded its bound")
+        for sample in samples:
+            require(all(isinstance(sample.get(name), int) for name in (
+                "packet_id_us", "transport_receive_us", "decode_start_us", "decode_end_us")),
+                "received packet is missing a timing boundary")
+            require(sample["transport_receive_us"] <= sample["decode_start_us"]
+                    <= sample["decode_end_us"],
+                    "received timing boundaries are out of order")
+        if row.get("playback_bytes", 0):
+            presented = [sample for sample in samples
+                         if sample.get("playback_submit_start_us") is not None]
+            require(bool(presented), "playback has no submission timestamps")
+            require(all(sample["playback_submit_start_us"] <= sample["playback_submit_end_us"]
+                        for sample in presented), "playback submission timing is out of order")
+            require(summary["playback_submit_us"]["samples"] == len(presented),
+                    "playback stage sample count changed")
+
+
+def verify_transport(result: dict) -> None:
+    transport = result.get("transport")
+    require(isinstance(transport, dict), "missing Kyber transport statistics")
+    require(transport.get("clock_domain") == "peer_monotonic_us_since_media_start",
+            "transport clock domain is missing or changed")
+    samples = transport.get("samples")
+    require(isinstance(samples, list) and len(samples) >= 2,
+            "transport run has too few counter samples")
+    require(all(left["peer_timestamp_us"] < right["peer_timestamp_us"]
+                for left, right in zip(samples, samples[1:])),
+            "transport sample timestamps are not increasing")
+    rtt_values = [sample["rtt_us"] for sample in samples if sample["rtt_us"] is not None]
+    require(transport["rtt_us"]["samples"] == len(rtt_values),
+            "RTT sample count does not match transport samples")
+    loss_values = [sample["lost_packets_total"] for sample in samples
+                   if sample["lost_packets_total"] is not None]
+    require(all(left <= right for left, right in zip(loss_values, loss_values[1:])),
+            "cumulative transport loss counter decreased")
+    if loss_values:
+        require(transport["lost_packets_total_start"] == loss_values[0]
+                and transport["lost_packets_total_end"] == loss_values[-1]
+                and transport["lost_packets_delta"] == loss_values[-1] - loss_values[0],
+                "transport loss delta does not match cumulative counters")
+    dropped = transport.get("protocol_dropped_packets")
+    require(dropped is None or isinstance(dropped, int) and dropped >= 0,
+            "protocol dropped-packet metric is invalid")
 
 
 def verify_media(output: Path, profile: str, direction: str, stop_screen: bool, *, lan: bool = False) -> None:
@@ -70,6 +264,8 @@ def verify_media(output: Path, profile: str, direction: str, stop_screen: bool, 
         track_names.append("screen")
     for role, other in [ROLES, ROLES[::-1]]:
         rows = read_result(output, role)["tracks"]
+        for row in rows:
+            verify_timing(row)
         incoming = {row["track"]: row for row in rows if row["received_packets"]}
         outgoing = {row["track"]: row for row in rows if row["sent_packets"]}
         expected_out = set(track_names) if direction in ("both", role) else set()
@@ -189,6 +385,7 @@ def run_case(
                 "direction": direction,
                 "duration_ms": duration,
                 "screen_stop_ms": screen_stop,
+                "playback_drain_timeout_ms": 12000 if playback else 0,
             }
             play = playback and role == "initiator"
             if play and audio_output is not None:
@@ -222,10 +419,18 @@ def run_case(
         if failure == "hangup":
             await_marker(listener / "microphone.receiving", peers["listener"], time.monotonic() + 6)
             stop_process(peers["initiator"])
-        deadline = time.monotonic() + (85 if capture is not None else 20)
+        resources = monitor_processes(
+            peers, 85 if capture is not None else 35 if playback else 20
+        )
+        (output / "resource-samples.json").write_text(json.dumps({
+            "clock_domain": "test_runner_monotonic_us_since_launch",
+            "processes": resources,
+        }, indent=2) + "\n", encoding="utf-8")
+        if failure is None:
+            verify_resource_samples(resources)
         for role, peer in peers.items():
-            status = peer.wait(timeout=max(0.1, deadline - time.monotonic()))
-            require((status == 0) == (failure is None), f"{role} unexpected exit {status}")
+            require((peer.returncode == 0) == (failure is None),
+                    f"{role} unexpected exit {peer.returncode}")
         if failure == "auth":
             require("authentication rejected" in read_stderr(output, "listener"), "wrong auth error")
         if failure == "timeout":
@@ -243,8 +448,12 @@ def run_case(
             require(not any((directory / "initiator").glob("*.receiving")),
                     "media was received after cancelling consent")
         if failure is None and capture is not None:
+            for role in ROLES:
+                verify_transport(read_result(output, role))
             verify_live_media(output, stop_screen=screen_stop is not None)
         if failure is None and capture is None:
+            for role in ROLES:
+                verify_transport(read_result(output, role))
             verify_media(output, profile, direction, screen_stop is not None, lan=sys.platform != "win32")
         if failure is None and playback:
             for row in read_result(output, "initiator")["tracks"]:
@@ -254,12 +463,44 @@ def run_case(
                 expected = row["samples"] * 4 if track == "microphone" else row["decoded_frames"] * 86400
                 require(row.get("playback_bytes") == expected and expected > 0,
                         f"{track} playback did not receive every decoded frame")
+                if track in ("camera", "screen"):
+                    events = row.get("presentation_events", [])
+                    require(bool(events), f"{track} has no native presentation events")
+                    packet_ids = {sample["packet_id_us"] for sample in row["timings"]}
+                    require(all(event["packet_id_us"] in packet_ids
+                                and event["helper_clock_domain"] == "playback_helper_monotonic_us_since_start"
+                                for event in events),
+                            f"{track} presentation event does not match a decoded packet")
+                    require(all(left["helper_timestamp_us"] < right["helper_timestamp_us"]
+                                for left, right in zip(events, events[1:])),
+                            f"{track} presentation clock is not increasing")
+                    summary = row.get("presentation_summary", {})
+                    superseded = row.get("presentation_superseded_frames")
+                    require(summary.get("presented_frames") == len(events)
+                            and summary.get("decoded_frames_without_paint_event")
+                                == max(0, row["decoded_frames"] - len(events))
+                            and isinstance(superseded, int)
+                            and 0 <= superseded
+                                <= summary["decoded_frames_without_paint_event"]
+                            and summary.get("clock_domain") == "playback_helper_monotonic_us_since_start"
+                            and summary.get("inter_event_interval_us", {}).get("samples")
+                                == max(0, len(events) - 1),
+                            f"{track} presentation summary is incomplete")
             for track in ("camera", "screen"):
                 if profile == "av_with_screen" or (profile == "av" and track == "camera"):
                     require(f"{track} frames" in read_stderr(output, "initiator"),
                             f"{track} viewer did not report presentation")
             require("stereo sample frames" in read_stderr(output, "initiator"),
                     "audio helper did not report completed playback")
+            audio = read_result(output, "initiator")["tracks"]
+            audio = next(row for row in audio if row["track"] == "microphone")
+            drain_events = audio.get("audio_drain_events", [])
+            require(len(drain_events) == 1
+                    and drain_events[0].get("sample_frames") == audio["samples"]
+                    and drain_events[0].get("helper_timestamp_us", 0) > 0
+                    and drain_events[0].get("helper_clock_domain")
+                        == "playback_helper_monotonic_us_since_start",
+                    "audio helper drain event does not match decoded sample frames")
         if failure is None and sys.platform == "win32":
             usage = {role: process_cpu_ms(peer.pid) for role, peer in peers.items()}
             (output / "cpu-ms.json").write_text(json.dumps(usage), encoding="utf-8")

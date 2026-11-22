@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <string_view>
@@ -18,6 +19,7 @@ constexpr int height = 180;
 constexpr unsigned i420_size = width * height * 3 / 2;
 
 int play_audio(HANDLE input, UINT device) {
+    const auto helper_start = std::chrono::steady_clock::now();
     WAVEFORMATEX format{WAVE_FORMAT_PCM, 2, 48000, 192000, 4, 16, 0};
     HWAVEOUT output = nullptr;
     const MMRESULT opened = waveOutOpen(&output, device, &format, 0, 0, CALLBACK_NULL);
@@ -87,6 +89,9 @@ int play_audio(HANDLE input, UINT device) {
     for (auto &block : blocks) {
         if (!release(block)) return 1;
     }
+    const auto helper_timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - helper_start).count();
+    std::cerr << "SKYBER_AUDIO_DRAINED " << delivered << " " << helper_timestamp_us << '\n';
     std::cerr << "Played " << delivered << " stereo sample frames\n";
     return delivered ? 0 : 1;
 }
@@ -94,13 +99,19 @@ int play_audio(HANDLE input, UINT device) {
 struct Viewer {
     std::array<std::uint8_t, width * height * 4> image{};
     unsigned rendered = 0;
+    unsigned superseded = 0;
+    std::uint64_t packet_id = 0;
+    bool awaiting_paint = false;
+    std::chrono::steady_clock::time_point helper_start = std::chrono::steady_clock::now();
 };
 
 std::uint8_t channel(int component) {
     return static_cast<std::uint8_t>(std::clamp(component, 0, 255));
 }
 
-void update(Viewer &viewer, const std::array<std::uint8_t, i420_size> &frame) {
+void update(Viewer &viewer, const std::array<std::uint8_t, i420_size> &frame,
+            std::uint64_t packet_id) {
+    if (viewer.awaiting_paint) ++viewer.superseded;
     for (int row = 0; row < height; ++row) {
         for (int col = 0; col < width; ++col) {
             const int pixel = row * width + col;
@@ -113,6 +124,8 @@ void update(Viewer &viewer, const std::array<std::uint8_t, i420_size> &frame) {
             viewer.image[pixel * 4 + 2] = channel((298*y + 409*v + 128) >> 8);
         }
     }
+    viewer.packet_id = packet_id;
+    viewer.awaiting_paint = true;
     ++viewer.rendered;
 }
 
@@ -124,7 +137,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         PostQuitMessage(0);
         return 0;
     } else if (message == WM_PAINT) {
-        const auto *viewer = reinterpret_cast<const Viewer *>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        auto *viewer = reinterpret_cast<Viewer *>(GetWindowLongPtrW(window, GWLP_USERDATA));
         PAINTSTRUCT paint{};
         const HDC dc = BeginPaint(window, &paint);
         RECT rect{};
@@ -144,6 +157,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 &bitmap, DIB_RGB_COLORS, SRCCOPY);
         }
         EndPaint(window, &paint);
+        if (viewer && viewer->awaiting_paint) {
+            const auto helper_timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - viewer->helper_start).count();
+            std::cerr << "SKYBER_PRESENT_VIDEO " << viewer->packet_id << " "
+                      << helper_timestamp_us << '\n';
+            viewer->awaiting_paint = false;
+        }
         return 0;
     }
     return DefWindowProcW(window, message, wparam, lparam);
@@ -165,6 +185,9 @@ int play_video(HANDLE input, bool screen) {
     if (!window) return 1;
     ShowWindow(window, SW_SHOWNOACTIVATE);
     std::array<std::uint8_t, i420_size> frame{};
+    std::array<std::uint8_t, sizeof(std::uint64_t)> packet_id_bytes{};
+    std::uint64_t packet_id = 0;
+    DWORD packet_id_used = 0;
     DWORD used = 0;
     while (IsWindow(window)) {
         MSG message{};
@@ -178,22 +201,38 @@ int play_video(HANDLE input, bool screen) {
         if (!PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr)) {
             const DWORD error = GetLastError();
             DestroyWindow(window);
-            if (error != ERROR_BROKEN_PIPE || used != 0 || !viewer.rendered) return 1;
+            if (error != ERROR_BROKEN_PIPE || packet_id_used != 0 || used != 0 || !viewer.rendered) return 1;
             break;
         }
         if (available) {
             DWORD received = 0;
-            const auto request = std::min(available, static_cast<DWORD>(frame.size()) - used);
-            if (!ReadFile(input, frame.data() + used, request, &received, nullptr) || !received) {
+            auto *destination = packet_id_used < packet_id_bytes.size()
+                ? packet_id_bytes.data() + packet_id_used : frame.data() + used;
+            const auto remaining = packet_id_used < packet_id_bytes.size()
+                ? static_cast<DWORD>(packet_id_bytes.size()) - packet_id_used
+                : static_cast<DWORD>(frame.size()) - used;
+            const auto request = std::min(available, remaining);
+            if (!ReadFile(input, destination, request, &received, nullptr) || !received) {
                 DestroyWindow(window);
                 return 1;
             }
-            used += received;
+            if (packet_id_used < packet_id_bytes.size()) {
+                packet_id_used += received;
+                if (packet_id_used == packet_id_bytes.size()) {
+                    packet_id = 0;
+                    for (std::size_t i = 0; i < packet_id_bytes.size(); ++i) {
+                        packet_id |= static_cast<std::uint64_t>(packet_id_bytes[i]) << (i * 8);
+                    }
+                }
+            } else {
+                used += received;
+            }
             if (used == frame.size()) {
                 used = 0;
-                update(viewer, frame);
+                update(viewer, frame, packet_id);
                 InvalidateRect(window, nullptr, FALSE);
                 UpdateWindow(window);
+                packet_id_used = 0;
             }
         } else {
             MsgWaitForMultipleObjects(0, nullptr, FALSE, 8, QS_ALLINPUT);
@@ -201,6 +240,8 @@ int play_video(HANDLE input, bool screen) {
     }
     std::cerr << "Presented " << viewer.rendered << " "
               << (screen ? "screen" : "camera") << " frames\n";
+    std::cerr << "SKYBER_VIDEO_SUPERSEDED " << (screen ? "screen" : "camera")
+              << " " << viewer.superseded << '\n';
     return 0;
 }
 }  // namespace

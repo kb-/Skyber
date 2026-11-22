@@ -256,14 +256,14 @@ int main(int argc, char **argv) {
     };
     UINT32 duration = 0;
     if (command == "--screen" && argc == 3) {
-        return parse(argv[2], duration) && duration >= 500 && duration <= 15000
+        return parse(argv[2], duration) && duration >= 500 && duration <= 900000
             ? capture_screen(duration) : help();
     }
     const std::string_view kind = argv[2];
     const bool listing = command == "--list" && argc == 3;
     const bool stream = command == "--stream" && argc == 5;
     const bool capture = (command == "--capture-one" && argc == 4) || stream;
-    if (stream && (!parse(argv[4], duration) || duration < 500 || duration > 15000)) return help();
+    if (stream && (!parse(argv[4], duration) || duration < 500 || duration > 900000)) return help();
     if ((!listing && !capture) || (kind != "camera" && kind != "microphone")) return help();
 
     UINT32 index = 0;

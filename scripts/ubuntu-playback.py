@@ -3,8 +3,10 @@
 
 import argparse
 import os
+import struct
 import sys
 import threading
+import time
 
 import gi
 
@@ -15,6 +17,18 @@ WIDTH = 320
 HEIGHT = 180
 VIDEO_BYTES = WIDTH * HEIGHT * 3 // 2
 AUDIO_BYTES = 960 * 4
+
+
+def read_exact(fd: int, size: int, *, allow_eof: bool = False) -> bytes | None:
+    data = bytearray()
+    while len(data) < size:
+        block = os.read(fd, size - len(data))
+        if not block:
+            if allow_eof and not data:
+                return None
+            raise RuntimeError("incomplete video presentation record")
+        data.extend(block)
+    return bytes(data)
 
 
 def build_pipeline(factories: tuple[str, ...]) -> tuple[Gst.Pipeline, list[Gst.Element]]:
@@ -48,6 +62,7 @@ def bus_result(bus: Gst.Bus, timeout: int = 0) -> Gst.Message | None:
 
 
 def audio(device: str | None) -> None:
+    helper_start_ns = time.monotonic_ns()
     pipeline, (source, volume, sink) = build_pipeline(("appsrc", "volume", "pulsesink"))
     source.set_property("caps", Gst.Caps.from_string(
         "audio/x-raw,format=S16LE,layout=interleaved,channels=2,rate=48000"
@@ -76,6 +91,9 @@ def audio(device: str | None) -> None:
             raise RuntimeError("cannot finish audio output")
         if bus_result(bus, 4 * Gst.SECOND) is None or not samples:
             raise RuntimeError("audio output did not drain")
+        helper_timestamp_us = (time.monotonic_ns() - helper_start_ns) // 1000
+        print(f"SKYBER_AUDIO_DRAINED {samples} {helper_timestamp_us}",
+              file=sys.stderr, flush=True)
         print(f"Played {samples} stereo sample frames", file=sys.stderr, flush=True)
     finally:
         pipeline.set_state(Gst.State.NULL)
@@ -98,14 +116,16 @@ def video(track: str) -> int:
     sink.set_property("drop", True)
 
     lock = threading.Lock()
-    latest = None
+    latest: tuple[bytes, int] | None = None
     finished = False
     error = None
     presented = 0
+    superseded = 0
+    helper_start_ns = time.monotonic_ns()
     app = Gtk.Application()
 
     def read_frames() -> None:
-        nonlocal latest, finished, error
+        nonlocal latest, finished, error, superseded
         bus = pipeline.get_bus()
         try:
             if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
@@ -114,14 +134,13 @@ def video(track: str) -> int:
             # A closed window can exit while this worker waits on stdin.
             # Use the file descriptor directly, avoiding a buffered stream lock.
             fd = sys.stdin.fileno()
-            partial = bytearray()
-            while block := os.read(fd, VIDEO_BYTES - len(partial)):
-                partial.extend(block)
-                if len(partial) != VIDEO_BYTES:
-                    continue
+            while header := read_exact(fd, 8, allow_eof=True):
+                packet_id = struct.unpack("<Q", header)[0]
+                frame = read_exact(fd, VIDEO_BYTES)
+                if frame is None:
+                    raise RuntimeError("missing video frame payload")
                 bus_result(bus)
-                feed(source, bytes(partial), index * Gst.SECOND // 15, Gst.SECOND // 15)
-                partial.clear()
+                feed(source, frame, index * Gst.SECOND // 15, Gst.SECOND // 15)
                 index += 1
                 sample = sink.emit("try-pull-sample", 2 * Gst.SECOND)
                 if sample is None:
@@ -131,9 +150,9 @@ def video(track: str) -> int:
                 if converted.get_size() != WIDTH * HEIGHT * 4:
                     raise RuntimeError("unexpected RGBA stride")
                 with lock:
-                    latest = converted.extract_dup(0, converted.get_size())
-            if partial:
-                raise RuntimeError("incomplete I420 frame")
+                    if latest is not None:
+                        superseded += 1
+                    latest = (converted.extract_dup(0, converted.get_size()), packet_id)
         except (OSError, RuntimeError) as failure:
             with lock:
                 error = str(failure)
@@ -149,22 +168,44 @@ def video(track: str) -> int:
         picture.set_content_fit(Gtk.ContentFit.CONTAIN)
         window.set_child(picture)
         window.present()
+        pending_packet_id: int | None = None
+        pending_generation = 0
+        reported_generation = 0
+
+        def after_paint(_clock: Gdk.FrameClock) -> None:
+            nonlocal pending_packet_id, reported_generation, presented
+            if pending_packet_id is None or reported_generation == pending_generation:
+                return
+            helper_timestamp_us = (time.monotonic_ns() - helper_start_ns) // 1000
+            print(f"SKYBER_PRESENT_VIDEO {pending_packet_id} {helper_timestamp_us}",
+                  file=sys.stderr, flush=True)
+            pending_packet_id = None
+            reported_generation = pending_generation
+            presented += 1
+
+        frame_clock = window.get_frame_clock()
+        if frame_clock is None:
+            raise RuntimeError("GTK window has no frame clock")
+        frame_clock.connect("after-paint", after_paint)
 
         def update() -> bool:
-            nonlocal latest, presented
+            nonlocal latest, pending_packet_id, pending_generation
             with lock:
-                pixels, latest = latest, None
+                image, latest = latest, None
                 done = finished
-            if pixels is not None:
+            if image is not None:
+                pixels, packet_id = image
                 texture = Gdk.MemoryTexture.new(
                     WIDTH, HEIGHT, Gdk.MemoryFormat.R8G8B8A8,
                     GLib.Bytes.new(pixels), WIDTH * 4,
                 )
                 picture.set_paintable(texture)
-                presented += 1
+                pending_packet_id = packet_id
+                pending_generation += 1
             if done:
-                application.quit()
-                return GLib.SOURCE_REMOVE
+                if reported_generation == pending_generation:
+                    application.quit()
+                    return GLib.SOURCE_REMOVE
             return GLib.SOURCE_CONTINUE
 
         GLib.timeout_add(16, update)
@@ -178,6 +219,7 @@ def video(track: str) -> int:
         if finished and not presented:
             raise RuntimeError("video output presented no frames")
     print(f"Presented {presented} {track} frames", file=sys.stderr, flush=True)
+    print(f"SKYBER_VIDEO_SUPERSEDED {track} {superseded}", file=sys.stderr, flush=True)
     return status
 
 

@@ -105,7 +105,7 @@ def run(peer: Path, case: Path, output: Path) -> None:
                 if role == "listener":
                     A1["await_marker"](work / "ready", child, time.monotonic() + 5)
                     print(f"{run_id} {scenario} listening", flush=True)
-                child.wait(timeout=80)
+                resources = A1["monitor_processes"]({role: child}, 80)
             except (RuntimeError, subprocess.TimeoutExpired) as error:
                 run_error = str(error)
             finally:
@@ -118,6 +118,10 @@ def run(peer: Path, case: Path, output: Path) -> None:
         "run_started_utc": started, "run_finished_utc": stamp(), "source": "synthetic", "codecs": ["Opus", "H.264"],
         "network": "Wi-Fi", "authenticated": authenticated, "port": load(case / "peer.json")["port"],
         "peer_sha256": hashlib.sha256(peer.read_bytes()).hexdigest(),
+        "resource_samples": {
+            "clock_domain": "test_runner_monotonic_us_since_launch",
+            "processes": resources if run_error is None else {},
+        },
         "build_inventory": inventory.read_text(encoding="utf-8") if inventory.exists() else None,
     })
     print(f"{role} exited {status} for {scenario}", flush=True)

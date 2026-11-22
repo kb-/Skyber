@@ -1,6 +1,6 @@
 # Gate A2 — Windows ↔ Ubuntu over a physical LAN
 
-**Status:** Proposed implementation and acceptance plan (2026-11-21). No A2 outcomes claimed.
+**Status:** Work in progress (2026-11-22). See per-stage evidence; full A2a/A2b acceptance is not claimed.
 **Parent:** [Skyber product/architecture plan](PLAN_SKYBER.md), [testing strategy](TESTING.md), [quality policy](QUALITY.md).
 **Baseline:** [Gate A1 results](research/GATE_A1_RESULTS.md) and [Kyber SDK audit](research/KYBER_SDK_AUDIT.md), merged to main in PR #1.
 
@@ -95,7 +95,7 @@ Oracle references: [webcam passthrough and Extension Pack](https://docs.oracle.c
 
 **Deliverable:** trustworthy latency and quality measurements on a real LAN.
 
-1. Instrument capture/source timestamps, encode start/end, enqueue, transport send/receive, decode start/end, presentation and audio playback boundaries. Provide frame/packet identity for correct correlation across codec buffering and frame reordering.
+1. Instrument capture/source timestamps, encode start/end, enqueue, transport send/receive, decode start/end, presentation and audio playback boundaries. Provide frame/packet identity for correct correlation across codec buffering and frame reordering. [Initial peer-boundary timing model](ADR/A2-2_TIMING.md).
 2. **Do not subtract uncalibrated Windows and Linux wall clocks.** One-way latency needs synchronized clocks with measured uncertainty, an independently observed external reference, or a correct timebase/clock-correlation method. RTT can be measured from one peer's monotonic clock.
 3. Measure **glass-to-glass** video with an external high-speed camera/LED/display reference or equivalent validated technique; distinguish that from internal time stamps. Audio delay and A/V lip sync also require end-to-end observation.
 4. Report p50/p95, distributions/sample counts, capture/frame rate, dropped/late frames, audio continuity, CPU/RAM, queue depth, network RTT/jitter/loss, host load and guest scheduling load. Capture both idle and concurrent camera+screen cases.
