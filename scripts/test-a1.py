@@ -113,6 +113,34 @@ def verify_timing(row: dict) -> None:
                     "playback stage sample count changed")
 
 
+def verify_transport(result: dict) -> None:
+    transport = result.get("transport")
+    require(isinstance(transport, dict), "missing Kyber transport statistics")
+    require(transport.get("clock_domain") == "peer_monotonic_us_since_media_start",
+            "transport clock domain is missing or changed")
+    samples = transport.get("samples")
+    require(isinstance(samples, list) and len(samples) >= 2,
+            "transport run has too few counter samples")
+    require(all(left["peer_timestamp_us"] < right["peer_timestamp_us"]
+                for left, right in zip(samples, samples[1:])),
+            "transport sample timestamps are not increasing")
+    rtt_values = [sample["rtt_us"] for sample in samples if sample["rtt_us"] is not None]
+    require(transport["rtt_us"]["samples"] == len(rtt_values),
+            "RTT sample count does not match transport samples")
+    loss_values = [sample["lost_packets_total"] for sample in samples
+                   if sample["lost_packets_total"] is not None]
+    require(all(left <= right for left, right in zip(loss_values, loss_values[1:])),
+            "cumulative transport loss counter decreased")
+    if loss_values:
+        require(transport["lost_packets_total_start"] == loss_values[0]
+                and transport["lost_packets_total_end"] == loss_values[-1]
+                and transport["lost_packets_delta"] == loss_values[-1] - loss_values[0],
+                "transport loss delta does not match cumulative counters")
+    dropped = transport.get("protocol_dropped_packets")
+    require(dropped is None or isinstance(dropped, int) and dropped >= 0,
+            "protocol dropped-packet metric is invalid")
+
+
 def verify_media(output: Path, profile: str, direction: str, stop_screen: bool, *, lan: bool = False) -> None:
     received = []
     track_names = ["microphone"]
@@ -297,8 +325,12 @@ def run_case(
             require(not any((directory / "initiator").glob("*.receiving")),
                     "media was received after cancelling consent")
         if failure is None and capture is not None:
+            for role in ROLES:
+                verify_transport(read_result(output, role))
             verify_live_media(output, stop_screen=screen_stop is not None)
         if failure is None and capture is None:
+            for role in ROLES:
+                verify_transport(read_result(output, role))
             verify_media(output, profile, direction, screen_stop is not None, lan=sys.platform != "win32")
         if failure is None and playback:
             for row in read_result(output, "initiator")["tracks"]:

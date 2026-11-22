@@ -226,6 +226,24 @@ struct PresentationSummary {
     inter_event_interval_us: Percentiles,
 }
 
+#[derive(Serialize)]
+struct TransportSample {
+    peer_timestamp_us: u64,
+    rtt_us: Option<u64>,
+    lost_packets_total: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct TransportReport {
+    clock_domain: &'static str,
+    rtt_us: Percentiles,
+    lost_packets_total_start: Option<u64>,
+    lost_packets_total_end: Option<u64>,
+    lost_packets_delta: Option<u64>,
+    protocol_dropped_packets: Option<u64>,
+    samples: Vec<TransportSample>,
+}
+
 #[derive(Clone, Default, Serialize)]
 struct TimingSample {
     packet_id_us: u64,
@@ -274,10 +292,9 @@ struct TimingSummary {
 fn percentiles(mut samples: Vec<u64>) -> Percentiles {
     samples.sort_unstable();
     let percentile = |percent| {
-        samples
-            .len()
-            .checked_sub(1)
-            .and_then(|last| samples.get(last * percent / 100).copied())
+        let rank = samples.len().checked_mul(percent)?.div_ceil(100);
+        rank.checked_sub(1)
+            .and_then(|index| samples.get(index).copied())
     };
     Percentiles {
         samples: samples.len(),
@@ -426,6 +443,37 @@ fn presentation_summary(events: &[PresentationEvent]) -> PresentationSummary {
         presented_frames: events.len(),
         frames_per_second,
         inter_event_interval_us: percentiles(intervals),
+    }
+}
+
+async fn transport_sample(
+    provider: &kymux::kyproto::KyProtoStatsProvider,
+    origin: Instant,
+) -> Result<TransportSample> {
+    let stats = provider.connection_stats().await;
+    Ok(TransportSample {
+        peer_timestamp_us: elapsed_micros(origin)?,
+        rtt_us: stats.rtt.and_then(|rtt| rtt.as_micros().try_into().ok()),
+        lost_packets_total: stats.packets_lost,
+    })
+}
+
+fn transport_report(
+    samples: Vec<TransportSample>,
+    protocol_dropped_packets: Option<u64>,
+) -> TransportReport {
+    let lost_packets_total_start = samples.first().and_then(|sample| sample.lost_packets_total);
+    let lost_packets_total_end = samples.last().and_then(|sample| sample.lost_packets_total);
+    TransportReport {
+        clock_domain: "peer_monotonic_us_since_media_start",
+        rtt_us: percentiles(samples.iter().filter_map(|sample| sample.rtt_us).collect()),
+        lost_packets_total_start,
+        lost_packets_total_end,
+        lost_packets_delta: lost_packets_total_start
+            .zip(lost_packets_total_end)
+            .and_then(|(start, end)| end.checked_sub(start)),
+        protocol_dropped_packets,
+        samples,
     }
 }
 
@@ -1039,6 +1087,8 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
         let duration =
             Duration::from_millis(config.duration_ms + config.capture_wait_ms) + drain_timeout;
         let origin = Instant::now();
+        let stats_provider = connection.stats_provider();
+        let mut transport_samples = vec![transport_sample(&stats_provider, origin).await?];
         let result = timeout(duration, async {
             let mut tasks = JoinSet::new();
             let source = u32::from(role == Role::Initiator);
@@ -1073,11 +1123,26 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
                 });
             }
             let mut observations = Vec::new();
-            while let Some(result) = tasks.join_next().await {
-                observations.push(result??);
+            let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
+            stats_interval.tick().await;
+            while !tasks.is_empty() {
+                tokio::select! {
+                    _ = stats_interval.tick() => {
+                        transport_samples.push(transport_sample(&stats_provider, origin).await?);
+                    }
+                    result = tasks.join_next() => {
+                        let Some(result) = result else { break; };
+                        observations.push(result??);
+                    }
+                }
             }
             endpoints.finish(role).await?;
-            Ok::<_, anyhow::Error>(observations)
+            transport_samples.push(transport_sample(&stats_provider, origin).await?);
+            let transport = transport_report(
+                transport_samples,
+                connection.protocol_stats().dropped_packets,
+            );
+            Ok::<_, anyhow::Error>((observations, transport))
         })
         .await
         .context("Kyber media run timed out")?;
@@ -1089,9 +1154,14 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
     }
     .await;
     connection.close();
+    let (tracks, transport) = result?;
     println!(
         "{}",
-        serde_json::json!({ "role": role.label(), "tracks": result? })
+        serde_json::json!({
+            "role": role.label(),
+            "tracks": tracks,
+            "transport": transport,
+        })
     );
     Ok(())
 }
@@ -1112,8 +1182,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod timing_tests {
     use super::{
-        PresentationEvent, TimingSample, packet_rate, parse_video_presentation_event, percentiles,
-        presentation_summary, timing_summary,
+        PresentationEvent, TimingSample, TransportSample, packet_rate,
+        parse_video_presentation_event, percentiles, presentation_summary, timing_summary,
+        transport_report,
     };
 
     #[test]
@@ -1158,7 +1229,30 @@ mod timing_tests {
         let stats = percentiles(vec![40, 10, 30, 20]);
         assert_eq!(stats.samples, 4);
         assert_eq!(stats.p50_us, Some(20));
-        assert_eq!(stats.p95_us, Some(30));
+        assert_eq!(stats.p95_us, Some(40));
+    }
+
+    #[test]
+    fn transport_summary_reports_local_rtt_and_loss_counter_delta() {
+        let samples = vec![
+            TransportSample {
+                peer_timestamp_us: 100,
+                rtt_us: Some(20_000),
+                lost_packets_total: Some(3),
+            },
+            TransportSample {
+                peer_timestamp_us: 1_000_100,
+                rtt_us: Some(30_000),
+                lost_packets_total: Some(5),
+            },
+        ];
+        let report = transport_report(samples, None);
+        assert_eq!(report.rtt_us.samples, 2);
+        assert_eq!(report.rtt_us.p95_us, Some(30_000));
+        assert_eq!(report.lost_packets_total_start, Some(3));
+        assert_eq!(report.lost_packets_total_end, Some(5));
+        assert_eq!(report.lost_packets_delta, Some(2));
+        assert_eq!(report.protocol_dropped_packets, None);
     }
 
     #[test]

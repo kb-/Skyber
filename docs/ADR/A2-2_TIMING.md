@@ -44,6 +44,15 @@ playback queues. The samples contain timing values and packet IDs only,
 never media bytes. The sender's packet PTS is a correlation key; a
 receiver must not subtract it from receiver-local timestamps.
 
+Each peer result also includes one-second connection-stat samples from the
+pinned Kyber `KyProtoStatsProvider`: Quinn path RTT and cumulative lost
+transport packets. The report includes peer-local sample times, RTT
+p50/p95, and the cumulative loss-counter delta across the run. These loss
+counters cover the QUIC connection, including control traffic; they are not
+counts of lost media frames. Kyproto's separate protocol dropped-packet
+counter is retained when available, but remains `null` for the reliable
+media endpoints used in this gate.
+
 ## Wi-Fi evidence (2026-11-22)
 
 The instrumented peer was run on the Windows 11 host and the Ubuntu
@@ -54,18 +63,29 @@ playback-helper submissions. The regression verifier also checked local
 event ordering and queue bounds. Compact raw results are retained at
 `target/a2-2/live/20261121T230559.854087Z/metrics-results.json`.
 
-| Direction | Track | Packets | Sender encode p50/p95 | Receiver decode p50/p95 | Playback pipe submit p50/p95 |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Windows → Ubuntu | Microphone | 292 / 292 | 173 / 266 µs | 182 / 619 µs | 10 / 33 µs |
-| Windows → Ubuntu | Camera | 66 / 66 | 441 / 633 µs | 717 / 1,576 µs | 329 / 737 µs |
-| Ubuntu → Windows | Microphone | 193 / 193 | 431 / 688 µs | 73 / 162 µs | 8 / 20 µs |
-| Ubuntu → Windows | Camera | 94 / 94 | 774 / 1,579 µs | 118 / 368 µs | 15 / 46 µs |
+| Direction | Track | Packets | Sender encode p50/p95 | Sender transport submit p50/p95 | Receiver decode p50/p95 | Playback pipe submit p50/p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Windows → Ubuntu | Microphone | 292 / 292 | 173 / 267 µs | 7 / 30 µs | 182 / 621 µs | 10 / 40 µs |
+| Windows → Ubuntu | Camera | 66 / 66 | 441 / 669 µs | 12 / 29 µs | 717 / 1,594 µs | 329 / 767 µs |
+| Ubuntu → Windows | Microphone | 193 / 193 | 431 / 705 µs | 8 / 13 µs | 73 / 170 µs | 8 / 20 µs |
+| Ubuntu → Windows | Camera | 94 / 94 | 774 / 1,632 µs | 11 / 47 µs | 118 / 397 µs | 15 / 47 µs |
 
 Each `Packets` cell is sent/received. These are per-peer stage durations,
 not one-way network delay; the last column ends at the Rust-to-helper pipe.
 The microphone run lengths differ because the live capture helpers finish
 their fixed sample/frame windows at different times. This is an initial
 instrumentation result and does not close the A2-2 gate.
+
+### LAN connection-stat smoke run
+
+A separate eight-second synthetic screen-stop call ran over Wi-Fi between
+Windows 11 (`192.168.1.30`) and Ubuntu 26.04.1 (`192.168.1.36`). Both
+peers emitted nine RTT samples, and each reported a zero change in the
+cumulative QUIC lost-packet counter. Windows RTT p50/p95 was 3,802 / 5,314
+µs; Ubuntu RTT p50/p95 was 3,554 / 10,820 µs. These are each peer's QUIC
+path RTT estimates, not one-way latency. Nine samples are only a smoke
+check and are insufficient for a stable network characterization. The
+protocol dropped-packet metric was unavailable (`null`) on both peers.
 
 ### Video paint event check
 
@@ -113,9 +133,8 @@ particular, the audio playback submission boundary ends at the helper
 pipe. Video presentation events report a correlated window/compositor
 paint, not a per-packet display device timestamp.
 
-The remaining A2-2 work is to add native audio output completion events,
-expose supported Kyber RTT and loss data, and collect CPU, memory,
-frame-rate and drop measurements. Glass-to-glass video and audio delay
-require an external reference such as a high-speed camera and
-LED/display. These are separate from the per-peer monotonic measurements
-above.
+The remaining A2-2 work is to add native audio output completion events
+and collect CPU, memory, frame-rate and application-drop measurements.
+Glass-to-glass video and audio delay require an external reference such as
+a high-speed camera and LED/display. These are separate from the per-peer
+monotonic measurements above.
