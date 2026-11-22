@@ -346,6 +346,7 @@ def run_case(
     capture: dict | None = None,
     playback: bool = False,
     audio_output: int | str | None = None,
+    sustained: bool = False,
 ) -> None:
     output.mkdir()
     with tempfile.TemporaryDirectory(prefix="skyber-a1-") as tmp, ExitStack() as cleanup:
@@ -384,6 +385,7 @@ def run_case(
                 "profile": profile,
                 "direction": direction,
                 "duration_ms": duration,
+                "sustained": sustained,
                 "screen_stop_ms": screen_stop,
                 "playback_drain_timeout_ms": 12000 if playback else 0,
             }
@@ -419,9 +421,10 @@ def run_case(
         if failure == "hangup":
             await_marker(listener / "microphone.receiving", peers["listener"], time.monotonic() + 6)
             stop_process(peers["initiator"])
-        resources = monitor_processes(
-            peers, 85 if capture is not None else 35 if playback else 20
+        timeout_seconds = (
+            duration / 1000 + 85 if capture is not None else 35 if playback else 20
         )
+        resources = monitor_processes(peers, timeout_seconds)
         (output / "resource-samples.json").write_text(json.dumps({
             "clock_domain": "test_runner_monotonic_us_since_launch",
             "processes": resources,

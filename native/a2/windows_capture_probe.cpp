@@ -145,6 +145,13 @@ HRESULT stream_device(IMFSourceReader *reader, SampleReader *callback, DWORD str
 
     std::array<float, capture::audio_samples> audio{};
     std::size_t audio_offset = 0;
+    std::uint64_t provider_buffers = 0;
+    std::uint64_t provider_frames = 0;
+    std::uint64_t max_send_us = 0;
+    std::uint64_t max_provider_gap_us = 0;
+    auto previous_provider = std::chrono::steady_clock::time_point{};
+    auto first_provider = std::chrono::steady_clock::time_point{};
+    auto last_provider = std::chrono::steady_clock::time_point{};
     auto start = std::chrono::steady_clock::now();
     auto next_frame = start;
     unsigned emitted = 0;
@@ -153,7 +160,15 @@ HRESULT stream_device(IMFSourceReader *reader, SampleReader *callback, DWORD str
         DWORD bytes = 0;
         status = next(reader, callback, stream, captured, bytes);
         if (FAILED(status)) return status;
-        const auto now = std::chrono::steady_clock::now();
+        const auto provider_time = std::chrono::steady_clock::now();
+        if (provider_buffers == 0) first_provider = provider_time;
+        else max_provider_gap_us = std::max<std::uint64_t>(
+            max_provider_gap_us, std::chrono::duration_cast<std::chrono::microseconds>(
+                provider_time - previous_provider).count());
+        previous_provider = provider_time;
+        last_provider = provider_time;
+        ++provider_buffers;
+        const auto now = provider_time;
         if (camera && now < next_frame) continue;
         ComPtr<IMFMediaBuffer> buffer;
         status = captured->ConvertToContiguousBuffer(&buffer);
@@ -185,13 +200,18 @@ HRESULT stream_device(IMFSourceReader *reader, SampleReader *callback, DWORD str
             status = buffer->Lock(&data, nullptr, &length);
             if (FAILED(status)) return status;
             bool ok = length % (channels * sizeof(std::int16_t)) == 0;
+            provider_frames += length / (channels * sizeof(std::int16_t));
             for (DWORD offset = 0; ok && offset < length; offset += channels * sizeof(std::int16_t)) {
                 std::int16_t pcm[2]{};
                 std::memcpy(pcm, data + offset, channels * sizeof(std::int16_t));
                 audio[audio_offset++] = pcm[0] / 32768.0f;
                 audio[audio_offset++] = pcm[channels - 1] / 32768.0f;
                 if (audio_offset == audio.size()) {
+                    const auto send_start = std::chrono::steady_clock::now();
                     ok = capture::send(audio.data(), sizeof(audio));
+                    max_send_us = std::max<std::uint64_t>(
+                        max_send_us, std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - send_start).count());
                     audio_offset = 0;
                     ++emitted;
                 }
@@ -200,6 +220,28 @@ HRESULT stream_device(IMFSourceReader *reader, SampleReader *callback, DWORD str
             if (!ok) return E_FAIL;
         }
     } while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(duration));
+    wchar_t diagnostics[2]{};
+    const bool diagnostics_enabled =
+        GetEnvironmentVariableW(L"SKYBER_AUDIO_DIAGNOSTICS", diagnostics, 2) == 1
+        && diagnostics[0] == L'1';
+    if (!camera && diagnostics_enabled) {
+        const auto intent_to_first_provider_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            first_provider - start).count();
+        std::wcerr << L"SKYBER_AUDIO_DIAGNOSTICS {\"provider_buffers\":" << provider_buffers
+                   << L",\"provider_sample_frames\":" << provider_frames
+                   << L",\"max_provider_gap_us\":" << max_provider_gap_us
+                   << L",\"provider_active_span_us\":"
+                   << std::chrono::duration_cast<std::chrono::microseconds>(
+                          last_provider - first_provider).count()
+                   << L",\"capture_intent_to_first_sample_us\":" << intent_to_first_provider_us
+                   << L",\"requested_active_duration_us\":"
+                   << static_cast<std::uint64_t>(duration) * 1000
+                   << L",\"provider_frames_expected_at_48khz\":"
+                   << static_cast<std::uint64_t>(duration) * 48
+                   << L",\"emitted_blocks\":" << emitted
+                   << L",\"partial_interleaved_samples\":" << audio_offset
+                   << L",\"max_stdout_write_flush_us\":" << max_send_us << L"}\n";
+    }
     return emitted ? S_OK : E_FAIL;
 }
 

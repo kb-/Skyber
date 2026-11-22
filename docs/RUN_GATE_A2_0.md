@@ -37,10 +37,13 @@ snippet for `Match User skyber-a2` with `AuthenticationMethods publickey`,
 configuration with `sudo sshd -t` before reloading. From the guest console
 display the SSH host fingerprint with
 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. Verify it on first
-connection and record it in a dedicated known-hosts file. Set
-`StrictHostKeyChecking yes`, `IdentitiesOnly yes`, `IdentityFile`, and
-`UserKnownHostsFile` in the Windows SSH host profile. Use `ssh skyber-a2 id`
-and SCP a disposable file in both directions to verify access.
+connection and record it in a dedicated known-hosts file. Keep the local
+connection profile in the ignored repository-root file
+`skyber-a2.sshconfig`. Set `StrictHostKeyChecking yes`, `IdentitiesOnly yes`,
+`IdentityFile`, and `UserKnownHostsFile` in that file. Connect with
+`ssh -F skyber-a2.sshconfig skyber-a2 id` and SCP a disposable file in both
+directions to verify access. The ignored file can contain the guest's private
+LAN address and local key paths without adding them to Git.
 
 For graphical checks, log into the guest as `skyber-a2` and open Settings,
 System, Remote Desktop, Desktop Sharing. Enable Desktop Sharing and

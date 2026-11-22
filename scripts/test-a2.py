@@ -1,6 +1,7 @@
 """Prepare, run and verify the opt-in Gate A2 synthetic media suite."""
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
@@ -79,7 +80,7 @@ def prepare(address: str, port: int) -> None:
     print(f"{run_id} {root}")
 
 
-def run(peer: Path, case: Path, output: Path) -> None:
+def run(peer: Path, case: Path, output: Path, in_place: bool = False) -> None:
     metadata = load(case / "run.json")
     role, scenario, run_id = (metadata[key] for key in ("role", "scenario", "run_id"))
     if role not in ROLES or scenario not in CASES or not run_id.replace(".", "").isalnum():
@@ -91,12 +92,20 @@ def run(peer: Path, case: Path, output: Path) -> None:
     report.unlink(missing_ok=True)
     run_error = None
     started = stamp()
-    # Fresh markers for every attempt. Credentials stay in the private source directory.
-    with tempfile.TemporaryDirectory(prefix="skyber-a2-peer-") as tmp:
-        work = Path(tmp)
-        for name in ("peer.json", "cert.pem", "key.pem"):
-            if (case / name).is_file():
-                shutil.copyfile(case / name, work / name)
+    # Use isolated per-attempt credentials unless the caller explicitly opts into its private case dir.
+    context = nullcontext(None) if in_place else tempfile.TemporaryDirectory(
+        prefix="skyber-a2-peer-"
+    )
+    with context as tmp:
+        work = case if in_place else Path(tmp)
+        if in_place:
+            for marker in ("ready", "authenticated", "microphone.receiving",
+                           "camera.receiving", "screen.receiving"):
+                (work / marker).unlink(missing_ok=True)
+        else:
+            for name in ("peer.json", "cert.pem", "key.pem"):
+                if (case / name).is_file():
+                    shutil.copyfile(case / name, work / name)
         with (result / f"{role}.stdout").open("wb") as stdout, (
             result / f"{role}.stderr"
         ).open("wb") as stderr:
@@ -206,6 +215,8 @@ def main() -> None:
     launch.add_argument("peer", type=Path)
     launch.add_argument("case", type=Path)
     launch.add_argument("--output", type=Path, default=Path("target/a2/runs"))
+    launch.add_argument("--in-place", action="store_true",
+                        help="run from this private case directory instead of copying credentials to a temp dir")
     check = commands.add_parser("verify")
     check.add_argument("run", type=Path)
     local = commands.add_parser("local")
@@ -215,7 +226,7 @@ def main() -> None:
     if args.command == "prepare":
         prepare(args.bind_address, args.port)
     elif args.command == "run":
-        run(args.peer, args.case, args.output)
+        run(args.peer, args.case, args.output, in_place=args.in_place)
     elif args.command == "verify":
         raise SystemExit(0 if verify(args.run) else 1)
     else:

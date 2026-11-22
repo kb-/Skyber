@@ -2,6 +2,7 @@
 """Normalize one Ubuntu capture source for the opt-in Skyber gate peer."""
 
 import argparse
+import json
 import os
 import re
 import stat
@@ -193,6 +194,18 @@ def capture(kind: str, duration_ms: int, device: str | None,
     last_sample = time.monotonic()
     sent = 0
     pending = bytearray()
+    provider_buffers = 0
+    provider_frames = 0
+    write_us_max = 0
+    active_start_ns = None
+    active_deadline_ns = None
+    previous_sample_ns = None
+    max_provider_gap_us = 0
+    negotiated_caps = None
+    buffer_duration_ns = 0
+    max_pts_gap_ns = 0
+    previous_pts = None
+    discontinuity_buffers = 0
     try:
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             raise CaptureError(f"could not start {kind} pipeline")
@@ -209,14 +222,33 @@ def capture(kind: str, duration_ms: int, device: str | None,
                     raise CaptureError(f"timed out waiting for {kind} data")
                 continue
             last_sample = time.monotonic()
+            provider_buffers += 1
+            sample_ns = time.monotonic_ns()
+            if previous_sample_ns is not None:
+                max_provider_gap_us = max(
+                    max_provider_gap_us, (sample_ns - previous_sample_ns) // 1000
+                )
+            previous_sample_ns = sample_ns
             if start is None:
                 start = last_sample
+                active_start_ns = sample_ns
+                active_deadline_ns = active_start_ns + duration_ms * 1000
             buffer = sample.get_buffer()
             size = buffer.get_size()
+            negotiated_caps = sample.get_caps().to_string()
+            if buffer.duration != Gst.CLOCK_TIME_NONE:
+                buffer_duration_ns += buffer.duration
+            if buffer.pts != Gst.CLOCK_TIME_NONE:
+                if previous_pts is not None:
+                    max_pts_gap_ns = max(max_pts_gap_ns, buffer.pts - previous_pts)
+                previous_pts = buffer.pts
+            if buffer.has_flags(Gst.BufferFlags.DISCONT):
+                discontinuity_buffers += 1
             if kind == "microphone":
                 if size > 1024 * 1024 or size % 8:
                     raise CaptureError("invalid PCM buffer size")
                 pending.extend(buffer.extract_dup(0, size))
+                provider_frames += size // 8
                 whole = len(pending) // PCM_BYTES * PCM_BYTES
                 while whole:
                     timestamp_us = (time.monotonic_ns() - helper_start_ns) // 1000
@@ -232,11 +264,41 @@ def capture(kind: str, duration_ms: int, device: str | None,
                 sys.stdout.buffer.write(struct.pack("<Q", timestamp_us))
                 sys.stdout.buffer.write(buffer.extract_dup(0, size))
                 sent += 1
+            write_start_ns = time.monotonic_ns()
             sys.stdout.buffer.flush()
+            write_us_max = max(write_us_max, (time.monotonic_ns() - write_start_ns) // 1000)
         if not sent:
             raise CaptureError(f"empty {kind} source")
     finally:
         pipeline.set_state(Gst.State.NULL)
+        if kind == "microphone" and os.environ.get("SKYBER_AUDIO_DIAGNOSTICS") == "1":
+            print("SKYBER_AUDIO_DIAGNOSTICS " + json.dumps({
+                "provider_buffers": provider_buffers,
+                "provider_sample_frames": provider_frames,
+                "negotiated_caps": negotiated_caps,
+                "provider_buffer_duration_us": buffer_duration_ns // 1000,
+                "max_provider_pts_gap_us": max_pts_gap_ns // 1000,
+                "discontinuity_buffers": discontinuity_buffers,
+                "max_provider_gap_us": max_provider_gap_us,
+                "emitted_blocks": sent,
+                "pending_pcm_bytes": len(pending),
+                "max_stdout_flush_us": write_us_max,
+                "capture_intent_to_first_sample_us": (
+                    (active_start_ns - int(helper_start_ns)) // 1000
+                    if active_start_ns is not None else None
+                ),
+                "requested_active_duration_us": duration_ms * 1000,
+                "provider_active_span_us": (
+                    (previous_sample_ns - active_start_ns) // 1000
+                    if previous_sample_ns is not None and active_start_ns is not None else None
+                ),
+                "provider_frames_expected_at_48khz": duration_ms * 48,
+                "capture_deadline_us": (
+                    (active_deadline_ns - int(helper_start_ns)) // 1000
+                    if active_deadline_ns is not None else None
+                ),
+                "last_sample_monotonic_us": (time.monotonic_ns() - helper_start_ns) // 1000,
+            }), file=sys.stderr, flush=True)
 
 
 def main() -> None:
