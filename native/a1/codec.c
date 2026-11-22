@@ -258,10 +258,15 @@ int32_t skyber_encode_i420(A1Codec *codec, const uint8_t *pixels, uint32_t size,
 
 static int read_audio(A1Codec *codec, A1Decoded *out) {
     const AVFrame *frame = codec->frame;
-    if (!frame->extended_data || frame->sample_rate != RATE || frame->ch_layout.nb_channels != 2) {
+    if (!frame->extended_data || !frame->extended_data[0]
+        || frame->sample_rate != RATE || frame->ch_layout.nb_channels != 2
+        || frame->nb_samples < 0 || frame->nb_samples > 5760) {
         return AVERROR_INVALIDDATA;
     }
     const bool planar = av_sample_fmt_is_planar(frame->format) != 0;
+    if (planar && !frame->extended_data[1]) {
+        return AVERROR_INVALIDDATA;
+    }
     const enum AVSampleFormat format = av_get_packed_sample_fmt(frame->format);
     if (format != AV_SAMPLE_FMT_FLT && format != AV_SAMPLE_FMT_S16) {
         return AVERROR(ENOSYS);
@@ -292,11 +297,47 @@ static int read_video(const AVFrame *frame, A1Decoded *out) {
     return 0;
 }
 
-int32_t a1_decode(A1Codec *codec, const uint8_t *data, uint32_t size, A1Decoded *out) {
-    if (!size || size > INT_MAX) {
+static void copy_audio_output(const AVFrame *frame, uint8_t *output) {
+    const bool planar = av_sample_fmt_is_planar(frame->format) != 0;
+    const bool floating = av_get_packed_sample_fmt(frame->format) == AV_SAMPLE_FMT_FLT;
+    for (int sample = 0; sample < frame->nb_samples; ++sample) {
+        for (int channel = 0; channel < 2; ++channel) {
+            const uint8_t *data = frame->extended_data[planar ? channel : 0];
+            const int index = planar ? sample : sample * 2 + channel;
+            int16_t value;
+            if (floating) {
+                const float pcm = ((const float *)data)[index];
+                value = !isfinite(pcm) ? 0 : pcm <= -1.0f ? INT16_MIN
+                    : pcm >= 1.0f ? INT16_MAX : (int16_t)lrintf(pcm * INT16_MAX);
+            } else {
+                value = ((const int16_t *)data)[index];
+            }
+            const uint16_t word = (uint16_t)value;
+            *output++ = (uint8_t)word;
+            *output++ = (uint8_t)(word >> 8);
+        }
+    }
+}
+
+static void copy_video_output(const AVFrame *frame, uint8_t *output) {
+    for (int plane = 0; plane < 3; ++plane) {
+        const int width = plane == 0 ? WIDTH : WIDTH / 2;
+        const int height = plane == 0 ? HEIGHT : HEIGHT / 2;
+        for (int row = 0; row < height; ++row) {
+            memcpy(output, frame->data[plane] + row * frame->linesize[plane], width);
+            output += width;
+        }
+    }
+}
+
+int32_t skyber_decode_output(A1Codec *codec, const uint8_t *data, uint32_t size,
+                             A1Decoded *out, uint8_t *frames, uint32_t capacity,
+                             uint32_t *written) {
+    if (!codec || !data || !out || !written || !size || size > INT_MAX || (capacity && !frames)) {
         return AVERROR(EINVAL);
     }
     *out = (A1Decoded){0};
+    *written = 0;
     int result = av_new_packet(codec->packet, (int)size);
     if (result < 0) {
         return result;
@@ -312,12 +353,32 @@ int32_t a1_decode(A1Codec *codec, const uint8_t *data, uint32_t size, A1Decoded 
         result = codec->track == A1_MICROPHONE
             ? read_audio(codec, out)
             : read_video(codec->frame, out);
+        if (result >= 0 && frames) {
+            const bool audio = codec->track == A1_MICROPHONE;
+            const uint32_t frame_bytes = audio
+                ? (uint32_t)codec->frame->nb_samples * 4 : WIDTH * HEIGHT * 3 / 2;
+            if (frame_bytes > capacity - *written) {
+                result = AVERROR(ENOSPC);
+            } else {
+                if (audio) {
+                    copy_audio_output(codec->frame, frames + *written);
+                } else {
+                    copy_video_output(codec->frame, frames + *written);
+                }
+                *written += frame_bytes;
+            }
+        }
         av_frame_unref(codec->frame);
         if (result < 0) {
             return result;
         }
     }
     return result == AVERROR(EAGAIN) ? 0 : result;
+}
+
+int32_t a1_decode(A1Codec *codec, const uint8_t *data, uint32_t size, A1Decoded *out) {
+    uint32_t unused = 0;
+    return skyber_decode_output(codec, data, size, out, NULL, 0, &unused);
 }
 
 int32_t skyber_a1_codec_probe_v1(uint32_t *decoded_samples) {

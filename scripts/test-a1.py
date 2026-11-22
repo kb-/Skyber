@@ -148,6 +148,8 @@ def run_case(
     screen_stop: int | None = None,
     failure: str | None = None,
     capture: dict | None = None,
+    playback: bool = False,
+    audio_output: int | str | None = None,
 ) -> None:
     output.mkdir()
     with tempfile.TemporaryDirectory(prefix="skyber-a1-") as tmp, ExitStack() as cleanup:
@@ -188,6 +190,9 @@ def run_case(
                 "duration_ms": duration,
                 "screen_stop_ms": screen_stop,
             }
+            play = playback and role == "initiator"
+            if play and audio_output is not None:
+                config["audio_output"] = audio_output
             live = capture is not None and role == "listener"
             if capture is not None:
                 config["capture_wait_ms"] = 63000
@@ -203,7 +208,8 @@ def run_case(
             stdout = cleanup.enter_context((output / f"{role}.stdout").open("wb"))
             stderr = cleanup.enter_context((output / f"{role}.stderr").open("wb"))
             peer = subprocess.Popen(
-                [str(peer_exe), *(["--capture"] if live else []), str(work)],
+                [str(peer_exe), *(["--capture"] if live else []),
+                 *(["--playback"] if play else []), str(work)],
                 stdout=stdout,
                 stderr=stderr,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -240,6 +246,20 @@ def run_case(
             verify_live_media(output, stop_screen=screen_stop is not None)
         if failure is None and capture is None:
             verify_media(output, profile, direction, screen_stop is not None, lan=sys.platform != "win32")
+        if failure is None and playback:
+            for row in read_result(output, "initiator")["tracks"]:
+                if not row["received_packets"]:
+                    continue
+                track = row["track"]
+                expected = row["samples"] * 4 if track == "microphone" else row["decoded_frames"] * 86400
+                require(row.get("playback_bytes") == expected and expected > 0,
+                        f"{track} playback did not receive every decoded frame")
+            for track in ("camera", "screen"):
+                if profile == "av_with_screen" or (profile == "av" and track == "camera"):
+                    require(f"{track} frames" in read_stderr(output, "initiator"),
+                            f"{track} viewer did not report presentation")
+            require("stereo sample frames" in read_stderr(output, "initiator"),
+                    "audio helper did not report completed playback")
         if failure is None and sys.platform == "win32":
             usage = {role: process_cpu_ms(peer.pid) for role, peer in peers.items()}
             (output / "cpu-ms.json").write_text(json.dumps(usage), encoding="utf-8")

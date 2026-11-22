@@ -73,6 +73,7 @@ struct Settings {
     capture: Option<DeviceCapture>,
     #[serde(default)]
     capture_wait_ms: u64,
+    audio_output: Option<DeviceSelector>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +152,12 @@ impl Settings {
                     && !matches!(config.profile, Profile::Audio)
                     && capture.screen == matches!(config.profile, Profile::AvWithScreen),
                 "invalid capture profile or device selector for this platform"
+            );
+        }
+        if let Some(output) = &config.audio_output {
+            ensure!(
+                output.matches_platform(),
+                "invalid audio output selector for this platform"
             );
         }
         Ok(config)
@@ -357,6 +364,71 @@ struct Observed {
     last_decoded_us: u64,
     pipeline_p50_us: u64,
     pipeline_p95_us: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    playback_bytes: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+async fn present(
+    track: Track,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    audio_output: Option<DeviceSelector>,
+) -> Result<usize> {
+    use std::process::Stdio;
+    use tokio::{io::AsyncWriteExt, process::Command};
+
+    let name = if cfg!(windows) {
+        "skyber-windows-playback.exe"
+    } else {
+        "skyber-ubuntu-playback"
+    };
+    let helper = std::env::current_exe()?.with_file_name(name);
+    let mut command = Command::new(helper);
+    command.arg(track.label());
+    if track == Track::Microphone {
+        match audio_output {
+            Some(DeviceSelector::Windows(index)) => {
+                command.arg(index.to_string());
+            }
+            Some(DeviceSelector::Ubuntu(name)) => {
+                command.arg(name);
+            }
+            None => {}
+        }
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start platform playback helper")?;
+    let mut stdin = child.stdin.take().context("missing playback pipe")?;
+    let mut delivered = 0;
+    let mut dismissed = false;
+    while let Some(bytes) = rx.recv().await {
+        if !dismissed {
+            match stdin.write_all(&bytes).await {
+                Ok(()) => delivered += bytes.len(),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::BrokenPipe
+                        && track != Track::Microphone =>
+                {
+                    // A user may close one video viewer while the other tracks continue.
+                    ensure!(child.wait().await?.success(), "video viewer failed");
+                    dismissed = true;
+                }
+                Err(error) => return Err(error).context("write frames to playback helper"),
+            }
+        }
+    }
+    drop(stdin);
+    if !dismissed {
+        ensure!(child.wait().await?.success(), "playback helper failed");
+    }
+    ensure!(delivered > 0 || dismissed, "playback had no decoded output");
+    Ok(delivered)
 }
 
 fn decode_track(
@@ -364,6 +436,7 @@ fn decode_track(
     config: Bytes,
     mut rx: mpsc::Receiver<types::MediaPacket>,
     origin: Option<Instant>,
+    playback: Option<mpsc::Sender<Vec<u8>>>,
 ) -> Result<Observed> {
     let mut decoder = Decoder::new(track, &config)?;
     let mut observed = Observed {
@@ -373,13 +446,22 @@ fn decode_track(
     let mut last_pts = 0;
     let mut crossings = 0;
     let mut timings = Vec::new();
+    let mut output = playback.as_ref().map(|_| vec![0; MAX_PACKET]);
     while let Some(packet) = rx.blocking_recv() {
         ensure!(
             packet.header.pts > last_pts,
             "non-increasing media timestamp"
         );
         last_pts = packet.header.pts;
-        let decoded = decoder.decode(&packet.payload)?;
+        let decoded = if let (Some(tx), Some(buffer)) = (&playback, &mut output) {
+            let (decoded, frames) = decoder.decode_output(&packet.payload, buffer)?;
+            if !frames.is_empty() {
+                tx.blocking_send(frames.to_vec())?;
+            }
+            decoded
+        } else {
+            decoder.decode(&packet.payload)?
+        };
         observed.received_packets += 1;
         if decoded.frames != 0 {
             let now = match origin {
@@ -418,6 +500,8 @@ async fn subscribe(
     (track, endpoint): Inbound,
     progress: PathBuf,
     origin: Option<Instant>,
+    playback: bool,
+    audio_output: Option<DeviceSelector>,
 ) -> Result<Observed> {
     let mut protocol = endpoint.ready().await?;
     let Some(types::AVPacket::Codec(params)) = protocol.recv().await? else {
@@ -435,9 +519,12 @@ async fn subscribe(
         "invalid codec configuration"
     );
     let (tx, rx) = mpsc::channel(2);
-    let worker =
-        tokio::task::spawn_blocking(move || decode_track(track, config.payload, rx, origin));
-    let network_result = async {
+    let (frames, output) = mpsc::channel(2);
+    let frames = playback.then_some(frames);
+    let worker = tokio::task::spawn_blocking(move || {
+        decode_track(track, config.payload, rx, origin, frames)
+    });
+    let receive = async move {
         let mut received = 0;
         while let Some(packet) = protocol.recv().await? {
             let types::AVPacket::Media(packet) = packet else {
@@ -457,15 +544,21 @@ async fn subscribe(
             received += 1;
         }
         Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    drop(tx);
-    let decoded = worker.await?;
-    network_result?;
-    decoded
+    };
+    let render = async {
+        if playback {
+            present(track, output, audio_output).await
+        } else {
+            Ok(0)
+        }
+    };
+    let decode = async { worker.await? };
+    let (_, delivered, mut observed) = tokio::try_join!(receive, render, decode)?;
+    observed.playback_bytes = delivered;
+    Ok(observed)
 }
 
-async fn run(directory: &Path, lan: bool, live: bool) -> Result<()> {
+async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<()> {
     let config = Settings::load(directory)?;
     ensure!(
         live == config.capture.is_some(),
@@ -574,8 +667,9 @@ async fn run(directory: &Path, lan: bool, live: bool) -> Result<()> {
             for endpoint in endpoints.inbound.drain(..) {
                 let track = endpoint.0;
                 let progress = directory.join(format!("{}.receiving", track.label()));
+                let audio_output = config.audio_output.clone();
                 tasks.spawn(async move {
-                    subscribe(endpoint, progress, origin)
+                    subscribe(endpoint, progress, origin, playback, audio_output)
                         .await
                         .with_context(|| format!("subscribing to {}", track.label()))
                 });
@@ -609,9 +703,10 @@ async fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
     let lan = args.next_if(|arg| arg == "--lan").is_some();
     let live = args.next_if(|arg| arg == "--capture").is_some();
+    let playback = args.next_if(|arg| arg == "--playback").is_some();
     let directory = args
         .next()
-        .context("usage: skyber-a1-peer [--lan] [--capture] RUN_DIRECTORY")?;
+        .context("usage: skyber-a1-peer [--lan] [--capture] [--playback] RUN_DIRECTORY")?;
     ensure!(args.next().is_none(), "unexpected peer arguments");
-    run(&PathBuf::from(directory), lan, live).await
+    run(&PathBuf::from(directory), lan, live, playback).await
 }

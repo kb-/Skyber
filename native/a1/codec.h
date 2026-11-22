@@ -34,6 +34,10 @@ A1_API int32_t skyber_encode_pcm_f32(A1Codec *codec, const float *samples, uint3
 A1_API int32_t skyber_encode_i420(A1Codec *codec, const uint8_t *pixels, uint32_t size,
                                  uint8_t *out, uint32_t capacity, uint32_t *key);
 A1_API int32_t a1_decode(A1Codec *codec, const uint8_t *data, uint32_t size, A1Decoded *out);
+/* Playback data is stereo S16LE PCM or packed I420, copied into caller memory. */
+A1_API int32_t skyber_decode_output(A1Codec *codec, const uint8_t *data, uint32_t size,
+                                    A1Decoded *out, uint8_t *frames, uint32_t capacity,
+                                    uint32_t *written);
 A1_API void a1_codec_close(A1Codec *codec);
 
 /* The MSVC probe consumes this single entry point. Its output belongs to the caller. */

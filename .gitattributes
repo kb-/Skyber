@@ -1,2 +1,3 @@
 *.sh text eol=lf
 scripts/ubuntu-capture.py text eol=lf
+scripts/ubuntu-playback.py text eol=lf
