@@ -11,12 +11,15 @@ a1-native = ["tokio/process", "tokio/io-util"]
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
 getrandom.workspace = true
 kymux.workspace = true
 quinn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 skyber-core.workspace = true
+skyber-signaling = { path = "../skyber-signaling" }
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
