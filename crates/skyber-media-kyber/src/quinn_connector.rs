@@ -8,12 +8,16 @@
 use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use crate::{
-    call_controller::CallPathConnector, ice_quinn::RelayQuinnSocket,
-    ice_session::NominatedIceConnection, path_policy::NetworkPath,
+    call_controller::{CallEvent, CallPathConnector},
+    ice_quinn::RelayQuinnSocket,
+    ice_session::NominatedIceConnection,
+    path_policy::NetworkPath,
 };
 use futures_util::{Sink, Stream};
 use quinn::{AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig};
-use skyber_signaling::{PeerCredentials, PeerIdentity, RelayClient, RoomId, SignalClient};
+use skyber_signaling::{
+    PeerCredentials, PeerIdentity, RelayClient, RoomId, SignalClient, SignalEvent,
+};
 use tokio::sync::watch;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, connect_async_tls_with_config, tungstenite::Error as WebSocketError,
@@ -199,6 +203,43 @@ where
             }
         })
     }
+
+    fn next_event(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<CallEvent, String>> + Send + '_>> {
+        Box::pin(async move {
+            match self
+                .signaling
+                .receive()
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                SignalEvent::PeerDisconnected(room) if room == self.room => {
+                    Ok(CallEvent::PeerDisconnected)
+                }
+                SignalEvent::PeerResumed { room, remote_peer }
+                    if room == self.room && remote_peer == self.remote_peer =>
+                {
+                    Ok(CallEvent::PeerResumed)
+                }
+                SignalEvent::PeerLeft(room) if room == self.room => Ok(CallEvent::PeerHungUp),
+                _ => Err("signaling returned an invalid call lifecycle event".to_owned()),
+            }
+        })
+    }
+
+    fn notify_hangup(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            self.signaling
+                .hangup(self.room)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.signaling
+                .close()
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
 }
 
 async fn wait_for_cancel(cancellation: &mut watch::Receiver<bool>) {
@@ -261,6 +302,16 @@ pub trait CallPathSocketProvider: Send {
         Self: 'a;
 
     fn acquire(&mut self, path: NetworkPath) -> Self::SocketFuture<'_>;
+
+    fn next_event(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<CallEvent, String>> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn notify_hangup(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Constructs the Quinn client or server endpoint and performs its handshake.
@@ -382,6 +433,16 @@ impl<P: CallPathSocketProvider> CallPathConnector for QuinnCallPathConnector<P> 
     fn close(&mut self) {
         QuinnCallPathConnector::close(self);
     }
+
+    fn next_event(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<CallEvent, String>> + Send + '_>> {
+        self.provider.next_event()
+    }
+
+    fn notify_hangup(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        self.provider.notify_hangup()
+    }
 }
 
 impl<P> Drop for QuinnCallPathConnector<P> {
@@ -418,7 +479,9 @@ mod tests {
         SignalingPathSocketProvider,
     };
     use crate::{
-        call_controller::CallController, ice_quinn::RelayQuinnSocket, path_policy::NetworkPath,
+        call_controller::{CallController, CallEvent},
+        ice_quinn::RelayQuinnSocket,
+        path_policy::NetworkPath,
     };
 
     struct RelayOnlyProvider {
@@ -759,7 +822,8 @@ mod tests {
         assert_eq!(inviter_reconnected.path(), NetworkPath::DirectUdp);
         assert_eq!(invitee_reconnected.path(), NetworkPath::DirectUdp);
 
-        inviter.hangup();
+        inviter.hangup_and_notify().await?;
+        assert_eq!(invitee.next_event().await?, CallEvent::PeerHungUp);
         invitee.hangup();
         server_task.abort();
         Ok(())

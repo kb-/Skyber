@@ -6,7 +6,7 @@
 //! direct-first selection, room authentication before Kymux, one alternate-path
 //! reconnect, cancellation and transport teardown.
 
-use std::{future::Future, time::Duration};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use ed25519_dalek::SigningKey;
 use quinn::Connection;
@@ -35,6 +35,25 @@ pub trait CallPathConnector {
 
     /// Release endpoint/socket resources associated with a successful path.
     fn close(&mut self) {}
+
+    /// Receive an authenticated room lifecycle event from signaling.
+    fn next_event(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<CallEvent, String>> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+
+    /// Notify the signaling peer that this call has ended.
+    fn notify_hangup(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallEvent {
+    PeerDisconnected,
+    PeerResumed,
+    PeerHungUp,
 }
 
 /// Owns one call's direct-first authenticated QUIC path and bounded recovery.
@@ -141,6 +160,25 @@ impl<C: CallPathConnector> CallController<C> {
 
     pub fn active_call(&self) -> Option<&ConnectedCall> {
         self.active.as_ref()
+    }
+
+    pub async fn next_event(&mut self) -> Result<CallEvent, CallControllerError> {
+        if self.active.is_none() {
+            return Err(CallControllerError::Closed);
+        }
+        self.connector
+            .next_event()
+            .await
+            .map_err(CallControllerError::Signaling)
+    }
+
+    /// Close the active QUIC path and send the room hang-up event.
+    pub async fn hangup_and_notify(&mut self) -> Result<(), CallControllerError> {
+        self.hangup();
+        self.connector
+            .notify_hangup()
+            .await
+            .map_err(CallControllerError::Signaling)
     }
 
     /// Access adapter configuration for the next path attempt or recovery.
@@ -253,6 +291,8 @@ pub enum CallControllerError {
     Closed,
     #[error("call setup was cancelled")]
     Cancelled,
+    #[error("call signaling event failed: {0}")]
+    Signaling(String),
     #[error("both direct and relay path attempts failed at {path:?}: {reason}")]
     AttemptsExhausted { path: NetworkPath, reason: String },
     #[error("the bounded reconnect attempt was exhausted")]
