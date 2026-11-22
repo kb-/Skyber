@@ -28,6 +28,7 @@ const PROBE_SIZE: usize = PROBE_HEADER_SIZE + PROBE_PAYLOAD_SIZE;
 const AUTH_OK: u8 = 0xA1;
 const AUTH_REJECTED: u8 = 0x00;
 const EXCHANGE_ACK: u8 = 0xA2;
+const SHUTDOWN_ACK: u8 = 0xA3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_WAIT: Duration = Duration::from_secs(15 * 60);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -193,9 +194,20 @@ pub async fn connect_and_probe(
     let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
         send.write_all(&[EXCHANGE_ACK]).await?;
         send.flush().await?;
-        send.closed()
+        let ack = read_fixed::<1, _>(
+            &mut receive,
+            SHUTDOWN_TIMEOUT,
+            "shutdown acknowledgment timed out",
+        )
+        .await?;
+        ensure!(
+            ack[0] == SHUTDOWN_ACK,
+            "invalid Gate C-0 shutdown acknowledgment"
+        );
+        receive.stop();
+        let _stop_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, send.closed())
             .await
-            .map_err(|_| anyhow::anyhow!("Gate C-0 shutdown acknowledgment failed"))?;
+            .context("Gate C-0 stream shutdown timed out")?;
         Ok::<(), anyhow::Error>(())
     })
     .await
@@ -278,9 +290,12 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
                 "invalid Gate C-0 exchange acknowledgment"
             );
             receive.stop();
-            raw.closed()
+            send.write_all(&[SHUTDOWN_ACK]).await?;
+            send.flush().await?;
+            let _stop_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, send.closed())
                 .await
-                .map_err(|_| anyhow::anyhow!("Gate C-0 peer shutdown failed"))?;
+                .context("Gate C-0 stream shutdown timed out")?;
+            raw.close(0, "Gate C-0 probe complete");
             Ok::<(), anyhow::Error>(())
         })
         .await
