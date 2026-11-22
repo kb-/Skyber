@@ -36,6 +36,14 @@ pub trait CallPathConnector {
     /// Release endpoint/socket resources associated with a successful path.
     fn close(&mut self) {}
 
+    /// Gracefully release an established path when the call is explicitly
+    /// ended. Implementations should keep the socket alive long enough to
+    /// flush the transport close notification.
+    fn shutdown(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.close();
+        Box::pin(std::future::ready(()))
+    }
+
     /// Receive an authenticated room lifecycle event from signaling.
     fn next_event(
         &mut self,
@@ -130,7 +138,7 @@ impl<C: CallPathConnector> CallController<C> {
     ) -> Result<&ConnectedCall, CallControllerError> {
         let current = self.active.take().ok_or(CallControllerError::Closed)?;
         current.close("call path lost");
-        self.connector.close();
+        self.connector.shutdown().await;
         let Some(attempt) = self.policy.connection_lost()? else {
             return Err(CallControllerError::RecoveryExhausted);
         };
@@ -174,7 +182,11 @@ impl<C: CallPathConnector> CallController<C> {
 
     /// Close the active QUIC path and send the room hang-up event.
     pub async fn hangup_and_notify(&mut self) -> Result<(), CallControllerError> {
-        self.hangup();
+        if let Some(call) = self.active.take() {
+            call.close("call ended");
+        }
+        self.connector.shutdown().await;
+        self.policy.close();
         self.connector
             .notify_hangup()
             .await

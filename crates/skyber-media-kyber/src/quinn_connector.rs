@@ -323,6 +323,7 @@ pub struct QuinnCallPathConnector<P> {
     server_config: ServerConfig,
     server_name: String,
     endpoint_config: EndpointConfig,
+    setup_timeout: Duration,
     active_endpoint: Option<Endpoint>,
     active_socket: Option<QuicPathSocket>,
 }
@@ -342,6 +343,7 @@ impl<P> QuinnCallPathConnector<P> {
             server_config,
             server_name,
             endpoint_config: EndpointConfig::default(),
+            setup_timeout: Duration::from_secs(100),
             active_endpoint: None,
             active_socket: None,
         }
@@ -349,6 +351,12 @@ impl<P> QuinnCallPathConnector<P> {
 
     pub fn with_endpoint_config(mut self, endpoint_config: EndpointConfig) -> Self {
         self.endpoint_config = endpoint_config;
+        self
+    }
+
+    /// Set the deadline for path socket acquisition and the Quinn handshake.
+    pub fn with_setup_timeout(mut self, timeout: Duration) -> Self {
+        self.setup_timeout = timeout;
         self
     }
 
@@ -424,7 +432,7 @@ impl<P: CallPathSocketProvider> CallPathConnector for QuinnCallPathConnector<P> 
 
     fn connect(&mut self, path: NetworkPath) -> Self::ConnectFuture<'_> {
         Box::pin(async move {
-            tokio::time::timeout(Duration::from_secs(100), self.connect_on_path(path))
+            tokio::time::timeout(self.setup_timeout, self.connect_on_path(path))
                 .await
                 .map_err(|_| "Quinn endpoint setup timed out".to_owned())?
         })
@@ -432,6 +440,18 @@ impl<P: CallPathSocketProvider> CallPathConnector for QuinnCallPathConnector<P> 
 
     fn close(&mut self) {
         QuinnCallPathConnector::close(self);
+    }
+
+    fn shutdown(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(endpoint) = self.active_endpoint.take() {
+                endpoint.close(quinn::VarInt::from_u32(0), b"call ended");
+                // Give Quinn a bounded opportunity to send CONNECTION_CLOSE
+                // while the path socket remains owned by this connector.
+                let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+            }
+            self.active_socket.take();
+        })
     }
 
     fn next_event(
@@ -456,10 +476,12 @@ mod tests {
     use std::{
         future::{Future, Ready, ready},
         net::SocketAddr,
+        pin::Pin,
         sync::Arc,
         time::Duration,
     };
 
+    use anyhow::Context as _;
     use ed25519_dalek::SigningKey;
     use quinn::{ClientConfig, ServerConfig};
     use skyber_signaling::{
@@ -488,6 +510,10 @@ mod tests {
         relay: Option<Arc<RelayQuinnSocket>>,
     }
 
+    struct TimeoutToRelayProvider {
+        relay: Option<Arc<RelayQuinnSocket>>,
+    }
+
     impl CallPathSocketProvider for RelayOnlyProvider {
         type SocketFuture<'a> = Ready<Result<QuicPathSocket, String>>;
 
@@ -500,6 +526,23 @@ mod tests {
                     .map(QuicPathSocket::Relay)
                     .ok_or_else(|| "test relay already consumed".to_owned())
                     .pipe(ready),
+            }
+        }
+    }
+
+    impl CallPathSocketProvider for TimeoutToRelayProvider {
+        type SocketFuture<'a> =
+            Pin<Box<dyn Future<Output = Result<QuicPathSocket, String>> + Send + 'a>>;
+
+        fn acquire(&mut self, path: NetworkPath) -> Self::SocketFuture<'_> {
+            match path {
+                NetworkPath::DirectUdp => Box::pin(std::future::pending()),
+                NetworkPath::WebSocketRelay => Box::pin(async move {
+                    self.relay
+                        .take()
+                        .map(QuicPathSocket::Relay)
+                        .ok_or_else(|| "test relay already consumed".to_owned())
+                }),
             }
         }
     }
@@ -594,6 +637,7 @@ mod tests {
     #[tokio::test]
     async fn controller_falls_back_to_authenticated_relay_and_binds_both_identities()
     -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let (client_ws, server_ws) = websocket_pair().await?;
         let inviter_addr: SocketAddr = "127.0.0.1:41000".parse()?;
         let invitee_addr: SocketAddr = "127.0.0.1:41001".parse()?;
@@ -652,6 +696,63 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn direct_path_timeout_falls_back_to_authenticated_relay() -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
+        let (client_ws, server_ws) = websocket_pair().await?;
+        let inviter_addr: SocketAddr = "127.0.0.1:41100".parse()?;
+        let invitee_addr: SocketAddr = "127.0.0.1:41101".parse()?;
+        let inviter_relay = RelayQuinnSocket::new(client_ws, inviter_addr, invitee_addr);
+        let invitee_relay = RelayQuinnSocket::new(server_ws, invitee_addr, inviter_addr);
+        let (client_config, server_config) = quic_configs()?;
+        let inviter_key = SigningKey::from_bytes(&[61; 32]);
+        let invitee_key = SigningKey::from_bytes(&[62; 32]);
+        let peers = AuthenticatedPeers {
+            room: RoomId::from_bytes([63; 16]),
+            inviter: PeerIdentity::from_signing_key(&inviter_key),
+            invitee: PeerIdentity::from_signing_key(&invitee_key),
+        };
+        let setup_timeout = Duration::from_millis(50);
+        let inviter_connector = QuinnCallPathConnector::new(
+            TimeoutToRelayProvider {
+                relay: Some(inviter_relay),
+            },
+            true,
+            client_config.clone(),
+            server_config.clone(),
+            "localhost".to_owned(),
+        )
+        .with_setup_timeout(setup_timeout);
+        let invitee_connector = QuinnCallPathConnector::new(
+            TimeoutToRelayProvider {
+                relay: Some(invitee_relay),
+            },
+            false,
+            client_config,
+            server_config,
+            "localhost".to_owned(),
+        )
+        .with_setup_timeout(setup_timeout);
+        let mut inviter = CallController::new(inviter_connector, peers, inviter_key)?;
+        let mut invitee = CallController::new(invitee_connector, peers, invitee_key)?;
+        let (_cancel_inviter, mut cancel_inviter) = watch::channel(false);
+        let (_cancel_invitee, mut cancel_invitee) = watch::channel(false);
+
+        let (inviter_call, invitee_call) = timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                inviter.connect(&mut cancel_inviter),
+                invitee.connect(&mut cancel_invitee),
+            )
+        })
+        .await??;
+
+        assert_eq!(inviter_call.path(), NetworkPath::WebSocketRelay);
+        assert_eq!(invitee_call.path(), NetworkPath::WebSocketRelay);
+        inviter.hangup();
+        invitee.hangup();
+        Ok(())
+    }
+
     #[test]
     fn tls_relay_connector_rejects_cleartext_and_secret_bearing_urls() {
         let tls = Arc::new(
@@ -683,6 +784,7 @@ mod tests {
     #[tokio::test]
     async fn typed_signaling_provider_falls_back_to_authenticated_wss_and_authenticates()
     -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
         let certificate = certified.cert.der().clone();
         let tls = server::tls_acceptor(
@@ -715,7 +817,9 @@ mod tests {
             )
             .await?;
         let SignalEvent::InvitationAccepted(inviter_room) =
-            timeout(Duration::from_secs(2), inviter_signaling.receive()).await??
+            timeout(Duration::from_secs(2), inviter_signaling.receive())
+                .await
+                .context("inviter did not receive invitation acceptance in time")??
         else {
             anyhow::bail!("expected accepted-room event for inviter");
         };
@@ -776,7 +880,8 @@ mod tests {
                 invitee.connect(&mut cancel_invitee),
             )
         })
-        .await??;
+        .await
+        .context("initial relay call setup or room authentication timed out")??;
         assert_eq!(inviter_call.path(), NetworkPath::WebSocketRelay);
         assert_eq!(invitee_call.path(), NetworkPath::WebSocketRelay);
         assert_eq!(inviter_call.local_peer(), peers.inviter);
@@ -789,10 +894,13 @@ mod tests {
         let (mut sender, mut receiver) = inviter_kyber.open_bi().await?;
         sender.write_all(b"post-auth-kymux").await?;
         sender.finish().await?;
-        let (mut reply, mut input) =
-            timeout(Duration::from_secs(2), invitee_kyber.accept_bi()).await??;
+        let (mut reply, mut input) = timeout(Duration::from_secs(2), invitee_kyber.accept_bi())
+            .await
+            .context("invitee did not receive the post-authentication Kymux stream")??;
         let mut payload = [0_u8; 15];
-        timeout(Duration::from_secs(2), input.read_exact(&mut payload)).await??;
+        timeout(Duration::from_secs(2), input.read_exact(&mut payload))
+            .await
+            .context("Kymux synthetic request payload timed out")??;
         anyhow::ensure!(&payload == b"post-auth-kymux", "unexpected Kyber payload");
         reply.write_all(b"ok").await?;
         reply.finish().await?;
@@ -801,7 +909,8 @@ mod tests {
             Duration::from_secs(2),
             receiver.read_exact(&mut acknowledgement),
         )
-        .await??;
+        .await
+        .context("Kymux synthetic response payload timed out")??;
         anyhow::ensure!(&acknowledgement == b"ok", "Kyber response was not received");
 
         inviter
@@ -818,14 +927,17 @@ mod tests {
                 invitee.reconnect(&mut cancel_invitee),
             )
         })
-        .await??;
+        .await
+        .context("bounded direct ICE reconnect timed out")??;
         assert_eq!(inviter_reconnected.path(), NetworkPath::DirectUdp);
         assert_eq!(invitee_reconnected.path(), NetworkPath::DirectUdp);
 
         let remote_connection = invitee_reconnected.quic_connection().clone();
         inviter.hangup_and_notify().await?;
         assert_eq!(invitee.next_event().await?, CallEvent::PeerHungUp);
-        timeout(Duration::from_secs(2), remote_connection.closed()).await?;
+        timeout(Duration::from_secs(2), remote_connection.closed())
+            .await
+            .context("QUIC close was not observed by the remote peer")?;
         invitee.hangup();
         server_task.abort();
         Ok(())

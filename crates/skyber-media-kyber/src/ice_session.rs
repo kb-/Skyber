@@ -593,6 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_agents_gather_exchange_candidates_and_nominate_ipv4() -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let mut controlling = test_session().await?;
         let mut controlled = test_session().await?;
         controlling.gather()?;
@@ -639,6 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_handle_stops_pending_connectivity_checks() -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let mut session = test_session().await?;
         session.gather()?;
         let candidate = gather_candidate(&mut session).await?;
@@ -661,6 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_signaling_drives_direct_ice_for_both_peer_roles() -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
         let certificate = certified.cert.der().clone();
         let acceptor = server::tls_acceptor(

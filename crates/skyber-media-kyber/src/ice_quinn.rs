@@ -472,6 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn nominated_ice_pair_carries_pinned_kyber_quic() -> Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let mut client_ice = IceSession::new(&[]).await?;
         let mut server_ice = IceSession::new(&[]).await?;
         client_ice.gather()?;
@@ -648,6 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_relay_carries_pinned_kyber_quic() -> Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         websocket_roundtrip(true).await?;
         // Start a fresh tunnel and QUIC connection after the first session closes.
         websocket_roundtrip(false).await

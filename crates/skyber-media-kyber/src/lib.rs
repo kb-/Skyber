@@ -9,6 +9,10 @@ pub mod quinn_connector;
 pub mod room_auth;
 pub mod transport;
 
+#[cfg(test)]
+pub(crate) static NETWORK_INTEGRATION_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 pub use ice_session::{
     IceCandidateEvent, IceRole, IceSession, IceSessionError, NominatedIceConnection,
     RemoteIceCredentials, SignaledIceError, negotiate_direct_ice,

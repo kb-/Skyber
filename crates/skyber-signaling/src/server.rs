@@ -888,7 +888,10 @@ async fn handle_message(
         }
         ClientMessage::Hangup { room } => {
             let room = RoomId::from_bytes(room);
-            hangup(room, connection.identity, shared).await;
+            if connection.room != Some(room) {
+                return Err(InvitationError::NotFound);
+            }
+            hangup(room, connection.identity, shared).await?;
             connection.room = None;
             connection.identity = None;
             Ok(())
@@ -936,27 +939,36 @@ async fn forward_to_peer(
     Err(InvitationError::CapacityExceeded)
 }
 
-async fn hangup(room: RoomId, identity: Option<PeerIdentity>, shared: &Arc<Mutex<SignalState>>) {
-    let Some(identity) = identity else { return };
+async fn hangup(
+    room: RoomId,
+    identity: Option<PeerIdentity>,
+    shared: &Arc<Mutex<SignalState>>,
+) -> Result<(), InvitationError> {
+    let identity = identity.ok_or(InvitationError::NotFound)?;
     let (target, relays) = {
         let mut state = shared.lock().await;
         if let Some(waiting) = state.waiting.get(&room) {
             if waiting.identity == identity {
                 state.waiting.remove(&room);
                 state.invitations.cancel_invitation(room, identity);
+                return Ok(());
             }
-            return;
+            return Err(InvitationError::WrongPeer);
         }
-        let Some(active) = state.active.remove(&room) else {
-            return;
+        let Some(active) = state.active.get(&room) else {
+            return Err(InvitationError::NotFound);
         };
         let target = if active.inviter == identity {
             active.invitee_outbound.clone()
         } else if active.invitee == identity {
             active.inviter_outbound.clone()
         } else {
-            None
+            return Err(InvitationError::WrongPeer);
         };
+        let active = state
+            .active
+            .remove(&room)
+            .ok_or(InvitationError::NotFound)?;
         let relays = [active.inviter_relay.clone(), active.invitee_relay.clone()];
         (target, relays)
     };
@@ -968,6 +980,7 @@ async fn hangup(room: RoomId, identity: Option<PeerIdentity>, shared: &Arc<Mutex
     for relay in relays.into_iter().flatten() {
         let _ = relay.try_send(RelayCommand::Close);
     }
+    Ok(())
 }
 
 async fn cleanup_connection(connection: &ConnectionState, shared: &Arc<Mutex<SignalState>>) {
@@ -1147,6 +1160,43 @@ mod tests {
         else {
             panic!("invitee should receive its reconnect credential");
         };
+
+        let outsider = PeerIdentity::from_signing_key(&SigningKey::from_bytes(&[63; 32]));
+        let mut outsider_connection = ConnectionState {
+            identity: Some(outsider),
+            room: Some(room_id),
+        };
+        assert_eq!(
+            handle_message(
+                ClientMessage::Hangup { room },
+                &mut outsider_connection,
+                &inviter_tx,
+                &state,
+            )
+            .await,
+            Err(crate::InvitationError::WrongPeer),
+            "a different authenticated identity must not tear down the room"
+        );
+        assert!(state.lock().await.active.contains_key(&room_id));
+        assert!(invitee_rx.try_recv().is_err());
+
+        let mut wrong_room_connection = ConnectionState {
+            identity: Some(inviter),
+            room: Some(room_id),
+        };
+        assert_eq!(
+            handle_message(
+                ClientMessage::Hangup { room: [0xA5; 16] },
+                &mut wrong_room_connection,
+                &inviter_tx,
+                &state,
+            )
+            .await,
+            Err(crate::InvitationError::NotFound),
+            "a peer must not hang up a room it is not joined to"
+        );
+        assert!(state.lock().await.active.contains_key(&room_id));
+        assert!(invitee_rx.try_recv().is_err());
 
         handle_message(
             ClientMessage::Candidate {

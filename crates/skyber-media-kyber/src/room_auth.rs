@@ -295,6 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn quic_room_mismatch_rejects_both_peers() -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let (client, server) = quic_pair().await?;
         let (client_peers, inviter, invitee, _) = fixture();
         let server_peers = AuthenticatedPeers {
@@ -312,6 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn quic_wrong_local_identity_is_rejected_and_closes_peer() -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let (client, server) = quic_pair().await?;
         let (peers, inviter, _, _) = fixture();
         let impersonator = SigningKey::from_bytes(&[44; 32]);
@@ -329,6 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn quic_room_proof_from_previous_connection_cannot_be_replayed() -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let (peers, inviter, invitee, _) = fixture();
 
         // A valid proof is bound to this connection's exporter. Retain a
@@ -362,6 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_quic_reconnect_authenticates_a_new_connection() -> anyhow::Result<()> {
+        let _network_test = crate::NETWORK_INTEGRATION_TEST_LOCK.lock().await;
         let (peers, inviter, invitee, _) = fixture();
         for _ in 0..2 {
             let (client, server) = quic_pair().await?;
