@@ -185,20 +185,19 @@ pub async fn connect_and_probe(
             read_fixed::<PROBE_SIZE, _>(&mut receive, EXCHANGE_TIMEOUT, "probe response timed out")
                 .await?;
         validate_probe_response(&response, payload)?;
-        send.write_all(&[EXCHANGE_ACK]).await?;
-        send.flush().await?;
-        send.finish().await?;
         Ok::<(), anyhow::Error>(())
     })
     .await
     .context("Gate C-0 exchange timed out");
 
-    if exchange_result.is_err() {
-        connection.close(1, "Gate C-0 exchange failed");
-    }
-    let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.closed())
-        .await
-        .context("Gate C-0 shutdown timed out");
+    let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+        send.write_all(&[EXCHANGE_ACK]).await?;
+        send.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("Gate C-0 shutdown timed out");
+    connection.close(0, "Gate C-0 probe complete");
     exchange_result??;
     shutdown_result??;
     Ok(())
@@ -259,19 +258,23 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
             let response = encode_probe_response(&request)?;
             send.write_all(&response).await?;
             send.flush().await?;
-            let ack =
-                read_fixed::<1, _>(&mut receive, EXCHANGE_TIMEOUT, "probe ack timed out").await?;
-            ensure!(ack[0] == EXCHANGE_ACK, "invalid Gate C-0 exchange ack");
-            send.finish().await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
         .context("Gate C-0 exchange timed out");
 
+        let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            let ack =
+                read_fixed::<1, _>(&mut receive, SHUTDOWN_TIMEOUT, "probe ack timed out").await?;
+            ensure!(
+                ack[0] == EXCHANGE_ACK,
+                "invalid Gate C-0 exchange acknowledgment"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("Gate C-0 shutdown timed out");
         raw.close(0, "Gate C-0 probe complete");
-        let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, raw.closed())
-            .await
-            .context("Gate C-0 shutdown timed out");
         exchange_result??;
         shutdown_result??;
         Ok::<(), anyhow::Error>(())
