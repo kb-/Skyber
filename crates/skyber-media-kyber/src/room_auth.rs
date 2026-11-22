@@ -34,6 +34,8 @@ pub enum RoomAuthError {
     ClosedStream(#[from] quinn::ClosedStream),
     #[error("QUIC room identity stream read failed: {0}")]
     Read(#[from] quinn::ReadExactError),
+    #[error("QUIC room identity stream read failed: {0}")]
+    StreamRead(#[from] quinn::ReadError),
     #[error("peer sent an invalid room identity proof")]
     InvalidProof,
     #[error("peer did not acknowledge room identity authentication")]
@@ -111,6 +113,7 @@ async fn authenticate_inner_result(
         let (mut send, mut receive) = connection.open_bi().await?;
         send.write_all(&[VERSION, role]).await?;
         send.write_all(&local_signature).await?;
+        send.finish()?;
         let mut remote_signature = [0u8; SIGNATURE_SIZE];
         receive.read_exact(&mut remote_signature).await?;
         verifying_key
@@ -124,7 +127,10 @@ async fn authenticate_inner_result(
         if acknowledgement[0] != ACK {
             return Err(RoomAuthError::MissingAcknowledgement);
         }
-        send.finish()?;
+        let mut trailing = [0u8; 1];
+        if !matches!(receive.read(&mut trailing).await?, None | Some(0)) {
+            return Err(RoomAuthError::InvalidProof);
+        }
     } else {
         let (mut send, mut receive) = connection.accept_bi().await?;
         let mut header = [0u8; 2];
@@ -134,6 +140,10 @@ async fn authenticate_inner_result(
         }
         let mut remote_signature = [0u8; SIGNATURE_SIZE];
         receive.read_exact(&mut remote_signature).await?;
+        let mut trailing = [0u8; 1];
+        if !matches!(receive.read(&mut trailing).await?, None | Some(0)) {
+            return Err(RoomAuthError::InvalidProof);
+        }
         verifying_key
             .verify(
                 &proof_message(0, peers, &exporter),
