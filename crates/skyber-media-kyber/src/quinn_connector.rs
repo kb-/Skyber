@@ -913,6 +913,16 @@ mod tests {
         .context("Kymux synthetic response payload timed out")??;
         anyhow::ensure!(&acknowledgement == b"ok", "Kyber response was not received");
 
+        inviter_call
+            .quic_connection()
+            .close(quinn::VarInt::from_u32(0xC1), b"test path loss");
+        assert_eq!(
+            timeout(Duration::from_secs(2), invitee.next_event())
+                .await
+                .context("call controller did not report QUIC path loss")??,
+            CallEvent::TransportLost
+        );
+
         inviter
             .connector_mut()
             .provider_mut()

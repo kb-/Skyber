@@ -62,6 +62,7 @@ pub enum CallEvent {
     PeerDisconnected,
     PeerResumed,
     PeerHungUp,
+    TransportLost,
 }
 
 /// Owns one call's direct-first authenticated QUIC path and bounded recovery.
@@ -171,26 +172,34 @@ impl<C: CallPathConnector> CallController<C> {
     }
 
     pub async fn next_event(&mut self) -> Result<CallEvent, CallControllerError> {
-        if self.active.is_none() {
-            return Err(CallControllerError::Closed);
+        let connection = self
+            .active
+            .as_ref()
+            .ok_or(CallControllerError::Closed)?
+            .quic_connection()
+            .clone();
+        tokio::select! {
+            biased;
+            event = self.connector.next_event() => {
+                event.map_err(CallControllerError::Signaling)
+            }
+            _ = connection.closed() => Ok(CallEvent::TransportLost),
         }
-        self.connector
-            .next_event()
-            .await
-            .map_err(CallControllerError::Signaling)
     }
 
     /// Close the active QUIC path and send the room hang-up event.
     pub async fn hangup_and_notify(&mut self) -> Result<(), CallControllerError> {
+        let signaling_result = self
+            .connector
+            .notify_hangup()
+            .await
+            .map_err(CallControllerError::Signaling);
         if let Some(call) = self.active.take() {
             call.close("call ended");
         }
         self.connector.shutdown().await;
         self.policy.close();
-        self.connector
-            .notify_hangup()
-            .await
-            .map_err(CallControllerError::Signaling)
+        signaling_result
     }
 
     /// Access adapter configuration for the next path attempt or recovery.
