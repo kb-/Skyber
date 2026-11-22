@@ -288,23 +288,35 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
             receive.stop();
             send.write_all(&[SHUTDOWN_ACK]).await?;
             send.flush().await?;
-            // The fixed-size application acknowledgment already confirms success;
-            // bound transport teardown and let endpoint close clean up if it lingers.
-            let _transport_close = tokio::time::timeout(SHUTDOWN_TIMEOUT, raw.closed()).await;
             Ok::<(), anyhow::Error>(())
         })
         .await
         .context("Gate C-0 shutdown timed out");
         exchange_result??;
         shutdown_result??;
-        Ok::<(), anyhow::Error>(())
+        // Return the connection after the required application handshake.
+        // Waiting for peer transport teardown is optional and must not consume
+        // the handshake deadline or change a successful probe into a failure.
+        Ok::<_, anyhow::Error>(raw)
     })
     .await
     .context("Gate C-0 listener timed out waiting for one probe");
 
+    let completed = match result {
+        Ok(Ok(raw)) => {
+            wait_for_transport_close(raw.closed(), SHUTDOWN_TIMEOUT).await;
+            Ok(())
+        }
+        Ok(Err(error)) | Err(error) => Err(error),
+    };
     server.close(0, "Gate C-0 probe complete");
-    result??;
-    Ok(())
+    completed
+}
+
+/// Observe a peer's optional transport shutdown within its own deadline.
+/// The application-level probe has already succeeded if this is called.
+async fn wait_for_transport_close<F: std::future::Future>(closed: F, deadline: Duration) {
+    let _ = tokio::time::timeout(deadline, closed).await;
 }
 
 async fn read_fixed<const N: usize, R: AsyncRead + Unpin>(
@@ -496,6 +508,30 @@ mod tests {
         )
         .await;
         assert!(stalled.is_err());
+    }
+
+    #[tokio::test]
+    async fn stalled_transport_teardown_does_not_invalidate_application_success() {
+        // Acknowledgment can finish before QUIC's close notification arrives.
+        let completed = tokio::time::timeout(Duration::from_millis(50), async {
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .expect("application acknowledgment must complete within its own deadline");
+        assert!(completed.is_ok());
+
+        // In particular, a peer that never closes must not stall teardown
+        // beyond this independent budget or change the result of the exchange.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_transport_close(
+                std::future::pending::<()>(),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("best-effort transport close must finish within its own budget");
+        assert!(completed.is_ok());
     }
 
     #[test]

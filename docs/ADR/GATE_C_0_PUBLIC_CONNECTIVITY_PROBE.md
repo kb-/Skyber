@@ -1,9 +1,10 @@
 # Gate C-0 — authenticated direct connectivity probe
 
-**Status:** Gate C-0 is open. Ubuntu IPv4/IPv6 and Windows IPv4 loopback
-authentication checks pass, as does a direct IPv4 exchange from Windows over
-4G to the Ubuntu home lab. The Windows IPv6 listener bind failed, and public
-IPv6 still needs validation where available.
+**Status:** The Gate C-0 authenticated IPv4 connectivity proof passed: Ubuntu
+and Windows IPv4 loopback checks and a direct Windows-over-4G to Ubuntu
+home-lab IPv4 exchange succeeded on 2026-11-22. Ubuntu IPv6 loopback also
+passed. Windows IPv6 listener binding and independent public IPv6 remain
+unresolved full-Gate-C follow-ups, not blockers for the IPv4 C-1 MVP.
 **Kyber revision:** `kymux` `af10dbb3ea016135c0ec8e01143179ad4bda005b`.
 
 ## Scope and security boundary
@@ -116,8 +117,10 @@ Do not replace the specific bind with `[::]` for a loopback test; that would
 listen on every IPv6 interface. Investigate a narrow upstream-compatible
 Windows IPv6 bind path before claiming Windows IPv6 support.
 
-To close Gate C-0, resolve the Windows IPv6 listener bind and repeat the
-authenticated IPv6 loopback exchange. Then run the public IPv6 probe if the
-test endpoints have an independent IPv6 path. Record the network limitation
-explicitly if that path is unavailable. Gate C-1 covers peer discovery, NAT
-traversal, and relay fallback.
+**IPv6 follow-up:** Resolve the Windows IPv6 listener bind and repeat the
+authenticated IPv6 loopback exchange; attempt the public IPv6 probe when
+independent IPv6 connectivity is available, or record that limitation.
+Track this separately under the full Gate C dual-stack requirement. These
+outstanding IPv6 checks do not invalidate the successful C-0 IPv4 probe and
+do not block Gate C-1's explicitly IPv4-scoped MVP. Gate C-1 covers peer
+discovery, NAT traversal, and relay fallback.
