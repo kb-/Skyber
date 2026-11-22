@@ -204,10 +204,6 @@ pub async fn connect_and_probe(
             ack[0] == SHUTDOWN_ACK,
             "invalid Gate C-0 shutdown acknowledgment"
         );
-        receive.stop();
-        let _stop_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, send.closed())
-            .await
-            .context("Gate C-0 stream shutdown timed out")?;
         Ok::<(), anyhow::Error>(())
     })
     .await
@@ -292,10 +288,7 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
             receive.stop();
             send.write_all(&[SHUTDOWN_ACK]).await?;
             send.flush().await?;
-            let _stop_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, send.closed())
-                .await
-                .context("Gate C-0 stream shutdown timed out")?;
-            raw.close(0, "Gate C-0 probe complete");
+            let _transport_close = tokio::time::timeout(SHUTDOWN_TIMEOUT, raw.closed()).await;
             Ok::<(), anyhow::Error>(())
         })
         .await
