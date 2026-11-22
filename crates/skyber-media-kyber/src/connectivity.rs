@@ -525,10 +525,7 @@ mod tests {
         // beyond this independent budget or change the result of the exchange.
         tokio::time::timeout(
             Duration::from_secs(1),
-            wait_for_transport_close(
-                std::future::pending::<()>(),
-                Duration::from_millis(10),
-            ),
+            wait_for_transport_close(std::future::pending::<()>(), Duration::from_millis(10)),
         )
         .await
         .expect("best-effort transport close must finish within its own budget");
