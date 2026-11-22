@@ -1,0 +1,557 @@
+//! Typed client operations for the TLS WebSocket signaling protocol.
+//!
+//! The caller supplies a WebSocket that has already completed TLS validation.
+//! Production code must use `wss://` with a trusted CA or an explicitly
+//! configured certificate pin before constructing this client.
+
+use std::time::Duration;
+
+use ed25519_dalek::{Signer, SigningKey};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use thiserror::Error;
+use tokio::time::timeout;
+use tokio_tungstenite::{tungstenite::Error as WebSocketError, tungstenite::Message};
+use zeroize::Zeroize;
+
+use crate::{
+    Invitation, InvitationToken, PeerIdentity, RoomId, accept_message, invite_request_message,
+    resume_message,
+    server::{ClientMessage, ServerMessage, WireInvitationToken, WireSecretString},
+};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_WS_MESSAGE: usize = 8 * 1024;
+const MAX_CANDIDATE_LENGTH: usize = 1024;
+const MAX_UFRAG_LENGTH: usize = 32;
+const MIN_ICE_PASSWORD_LENGTH: usize = 22;
+const MAX_ICE_PASSWORD_LENGTH: usize = 256;
+
+/// Typed signaling client over an already authenticated WebSocket connection.
+pub struct SignalClient<S> {
+    websocket: S,
+}
+
+impl<S> SignalClient<S>
+where
+    S: Sink<Message, Error = WebSocketError>
+        + Stream<Item = Result<Message, WebSocketError>>
+        + Unpin,
+{
+    /// Wrap a WebSocket after its TLS peer certificate has been validated.
+    ///
+    /// This type does not perform TLS itself so callers can apply their
+    /// platform's trust store or an explicit service certificate pin.
+    pub fn from_authenticated_websocket(websocket: S) -> Self {
+        Self { websocket }
+    }
+
+    /// Create a signed invitation for a specific peer identity.
+    pub async fn create_invitation(
+        &mut self,
+        invitee: PeerIdentity,
+        signing_key: &SigningKey,
+    ) -> Result<Invitation, SignalClientError> {
+        let inviter = PeerIdentity::from_signing_key(signing_key);
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).map_err(|_| SignalClientError::RandomUnavailable)?;
+        let signature = signing_key.sign(&invite_request_message(inviter, invitee, nonce));
+        self.send(ClientMessage::CreateInvitation {
+            inviter: *inviter.as_bytes(),
+            invitee: *invitee.as_bytes(),
+            nonce,
+            signature: signature.to_bytes().to_vec(),
+        })
+        .await?;
+
+        match self.receive_message().await? {
+            ServerMessage::InvitationCreated {
+                room,
+                token,
+                expires_in_seconds,
+            } => Ok(Invitation {
+                room: RoomId::from_bytes(room),
+                token: InvitationToken(token.0),
+                expires_in: Duration::from_secs(u64::from(expires_in_seconds)),
+            }),
+            ServerMessage::Error { code } => Err(SignalClientError::Rejected(code)),
+            _ => Err(SignalClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Accept a one-use invitation and verify the signaling service reports
+    /// the expected inviter identity before returning reconnect credentials.
+    pub async fn accept_invitation(
+        &mut self,
+        room: RoomId,
+        token: &InvitationToken,
+        expected_inviter: PeerIdentity,
+        signing_key: &SigningKey,
+    ) -> Result<AcceptedRoom, SignalClientError> {
+        let invitee = PeerIdentity::from_signing_key(signing_key);
+        let signature = signing_key.sign(&accept_message(room, invitee, token.expose()));
+        self.send(ClientMessage::AcceptInvitation {
+            room: *room.as_bytes(),
+            invitee: *invitee.as_bytes(),
+            token: WireInvitationToken(*token.expose()),
+            signature: signature.to_bytes().to_vec(),
+        })
+        .await?;
+
+        match self.receive_message().await? {
+            ServerMessage::InvitationAccepted {
+                room: accepted_room,
+                remote_peer,
+                resume_token,
+                relay_token,
+            } => {
+                let remote_peer = PeerIdentity::from_bytes(remote_peer)
+                    .map_err(|_| SignalClientError::InvalidIdentity)?;
+                let accepted_room = RoomId::from_bytes(accepted_room);
+                if accepted_room != room || remote_peer != expected_inviter {
+                    return Err(SignalClientError::PeerBindingMismatch);
+                }
+                Ok(AcceptedRoom {
+                    room,
+                    remote_peer,
+                    credentials: PeerCredentials {
+                        resume: InvitationToken(resume_token.0),
+                        relay: InvitationToken(relay_token.0),
+                    },
+                })
+            }
+            ServerMessage::Error { code } => Err(SignalClientError::Rejected(code)),
+            _ => Err(SignalClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Reauthenticate a disconnected peer using its separate reconnect token.
+    pub async fn resume(
+        &mut self,
+        room: RoomId,
+        credential: &InvitationToken,
+        signing_key: &SigningKey,
+    ) -> Result<(), SignalClientError> {
+        let peer = PeerIdentity::from_signing_key(signing_key);
+        let signature = signing_key.sign(&resume_message(room, peer, credential.expose()));
+        self.send(ClientMessage::ResumeRoom {
+            room: *room.as_bytes(),
+            peer: *peer.as_bytes(),
+            token: WireInvitationToken(*credential.expose()),
+            signature: signature.to_bytes().to_vec(),
+        })
+        .await
+    }
+
+    /// Forward a gathered ICE candidate to the authenticated room peer.
+    pub async fn send_candidate(
+        &mut self,
+        room: RoomId,
+        candidate: String,
+    ) -> Result<(), SignalClientError> {
+        if candidate.is_empty() || candidate.len() > MAX_CANDIDATE_LENGTH {
+            return Err(SignalClientError::InvalidFieldLength);
+        }
+        self.send(ClientMessage::Candidate {
+            room: *room.as_bytes(),
+            candidate,
+        })
+        .await
+    }
+
+    /// Forward ICE credentials to the authenticated room peer.
+    pub async fn send_ice_credentials(
+        &mut self,
+        room: RoomId,
+        ufrag: String,
+        password: String,
+    ) -> Result<(), SignalClientError> {
+        if ufrag.is_empty()
+            || ufrag.len() > MAX_UFRAG_LENGTH
+            || password.len() < MIN_ICE_PASSWORD_LENGTH
+            || password.len() > MAX_ICE_PASSWORD_LENGTH
+        {
+            return Err(SignalClientError::InvalidFieldLength);
+        }
+        self.send(ClientMessage::IceCredentials {
+            room: *room.as_bytes(),
+            ufrag: WireSecretString(ufrag),
+            password: WireSecretString(password),
+        })
+        .await
+    }
+
+    /// Notify the room peer and close this call's signaling state.
+    pub async fn hangup(&mut self, room: RoomId) -> Result<(), SignalClientError> {
+        self.send(ClientMessage::Hangup {
+            room: *room.as_bytes(),
+        })
+        .await
+    }
+
+    /// Wait for the next peer event. The timeout bounds stalled setup and
+    /// connection-loss handling; applications can call again while connected.
+    pub async fn receive(&mut self) -> Result<SignalEvent, SignalClientError> {
+        match self.receive_message().await? {
+            ServerMessage::InvitationCreated { .. } => Err(SignalClientError::UnexpectedResponse),
+            ServerMessage::InvitationAccepted {
+                room,
+                remote_peer,
+                resume_token,
+                relay_token,
+            } => Ok(SignalEvent::InvitationAccepted(AcceptedRoom {
+                room: RoomId::from_bytes(room),
+                remote_peer: PeerIdentity::from_bytes(remote_peer)
+                    .map_err(|_| SignalClientError::InvalidIdentity)?,
+                credentials: PeerCredentials {
+                    resume: InvitationToken(resume_token.0),
+                    relay: InvitationToken(relay_token.0),
+                },
+            })),
+            ServerMessage::PeerDisconnected { room } => {
+                Ok(SignalEvent::PeerDisconnected(RoomId::from_bytes(room)))
+            }
+            ServerMessage::PeerResumed { room, remote_peer } => Ok(SignalEvent::PeerResumed {
+                room: RoomId::from_bytes(room),
+                remote_peer: PeerIdentity::from_bytes(remote_peer)
+                    .map_err(|_| SignalClientError::InvalidIdentity)?,
+            }),
+            ServerMessage::RelayReady { .. } => Err(SignalClientError::UnexpectedResponse),
+            ServerMessage::IceCredentials {
+                room,
+                from_peer,
+                ufrag,
+                password,
+            } => {
+                if ufrag.0.is_empty()
+                    || ufrag.0.len() > MAX_UFRAG_LENGTH
+                    || password.0.len() < MIN_ICE_PASSWORD_LENGTH
+                    || password.0.len() > MAX_ICE_PASSWORD_LENGTH
+                {
+                    return Err(SignalClientError::InvalidFieldLength);
+                }
+                Ok(SignalEvent::IceCredentials {
+                    room: RoomId::from_bytes(room),
+                    from_peer: PeerIdentity::from_bytes(from_peer)
+                        .map_err(|_| SignalClientError::InvalidIdentity)?,
+                    ufrag: SecretString(ufrag.0.clone()),
+                    password: SecretString(password.0.clone()),
+                })
+            }
+            ServerMessage::Candidate {
+                room,
+                from_peer,
+                candidate,
+            } => {
+                if candidate.is_empty() || candidate.len() > MAX_CANDIDATE_LENGTH {
+                    return Err(SignalClientError::InvalidFieldLength);
+                }
+                Ok(SignalEvent::Candidate {
+                    room: RoomId::from_bytes(room),
+                    from_peer: PeerIdentity::from_bytes(from_peer)
+                        .map_err(|_| SignalClientError::InvalidIdentity)?,
+                    candidate,
+                })
+            }
+            ServerMessage::PeerLeft { room } => Ok(SignalEvent::PeerLeft(RoomId::from_bytes(room))),
+            ServerMessage::Error { code } => Err(SignalClientError::Rejected(code)),
+        }
+    }
+
+    /// Close the WebSocket cleanly during call teardown.
+    pub async fn close(&mut self) -> Result<(), SignalClientError> {
+        self.websocket
+            .close()
+            .await
+            .map_err(SignalClientError::WebSocket)
+    }
+
+    async fn send(&mut self, message: ClientMessage) -> Result<(), SignalClientError> {
+        let text = serde_json::to_string(&message).map_err(SignalClientError::Json)?;
+        timeout(
+            REQUEST_TIMEOUT,
+            self.websocket.send(Message::Text(text.into())),
+        )
+        .await
+        .map_err(|_| SignalClientError::Timeout)?
+        .map_err(SignalClientError::WebSocket)
+    }
+
+    async fn receive_message(&mut self) -> Result<ServerMessage, SignalClientError> {
+        let frame = timeout(REQUEST_TIMEOUT, self.websocket.next())
+            .await
+            .map_err(|_| SignalClientError::Timeout)?
+            .ok_or(SignalClientError::Closed)?
+            .map_err(SignalClientError::WebSocket)?;
+        let Message::Text(text) = frame else {
+            return Err(SignalClientError::UnexpectedFrame);
+        };
+        if text.len() > MAX_WS_MESSAGE {
+            return Err(SignalClientError::InvalidFieldLength);
+        }
+        serde_json::from_str(&text).map_err(SignalClientError::Json)
+    }
+}
+
+/// The peer and per-peer credentials returned after invitation acceptance.
+pub struct AcceptedRoom {
+    pub room: RoomId,
+    pub remote_peer: PeerIdentity,
+    pub credentials: PeerCredentials,
+}
+
+impl std::fmt::Debug for AcceptedRoom {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcceptedRoom")
+            .field("room", &self.room)
+            .field("remote_peer", &self.remote_peer)
+            .field("credentials", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Separate reconnect and encrypted-relay credentials for one room peer.
+pub struct PeerCredentials {
+    resume: InvitationToken,
+    relay: InvitationToken,
+}
+
+impl PeerCredentials {
+    pub const fn resume_token(&self) -> &InvitationToken {
+        &self.resume
+    }
+
+    pub const fn relay_token(&self) -> &InvitationToken {
+        &self.relay
+    }
+}
+
+impl std::fmt::Debug for PeerCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PeerCredentials([redacted])")
+    }
+}
+
+/// Events routed by the signaling service for a connected room.
+pub enum SignalEvent {
+    InvitationAccepted(AcceptedRoom),
+    PeerDisconnected(RoomId),
+    PeerResumed {
+        room: RoomId,
+        remote_peer: PeerIdentity,
+    },
+    IceCredentials {
+        room: RoomId,
+        from_peer: PeerIdentity,
+        ufrag: SecretString,
+        password: SecretString,
+    },
+    Candidate {
+        room: RoomId,
+        from_peer: PeerIdentity,
+        candidate: String,
+    },
+    PeerLeft(RoomId),
+}
+
+impl std::fmt::Debug for SignalEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvitationAccepted(accepted) => formatter
+                .debug_tuple("InvitationAccepted")
+                .field(accepted)
+                .finish(),
+            Self::PeerDisconnected(room) => formatter
+                .debug_tuple("PeerDisconnected")
+                .field(room)
+                .finish(),
+            Self::PeerResumed { room, remote_peer } => formatter
+                .debug_struct("PeerResumed")
+                .field("room", room)
+                .field("remote_peer", remote_peer)
+                .finish(),
+            Self::IceCredentials {
+                room, from_peer, ..
+            } => formatter
+                .debug_struct("IceCredentials")
+                .field("room", room)
+                .field("from_peer", from_peer)
+                .field("credentials", &"[redacted]")
+                .finish(),
+            Self::Candidate {
+                room,
+                from_peer,
+                candidate,
+            } => formatter
+                .debug_struct("Candidate")
+                .field("room", room)
+                .field("from_peer", from_peer)
+                .field("candidate", candidate)
+                .finish(),
+            Self::PeerLeft(room) => formatter.debug_tuple("PeerLeft").field(room).finish(),
+        }
+    }
+}
+
+/// ICE credentials with redacted formatting and zeroizing drop behavior.
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SignalClientError {
+    #[error("operating system random source failed")]
+    RandomUnavailable,
+    #[error("signaling service closed the WebSocket")]
+    Closed,
+    #[error("signaling service returned an unexpected WebSocket frame")]
+    UnexpectedFrame,
+    #[error("signaling service returned an unexpected response")]
+    UnexpectedResponse,
+    #[error("signaling operation timed out")]
+    Timeout,
+    #[error("signaling request was rejected: {0}")]
+    Rejected(String),
+    #[error("signaling response contains an invalid peer identity")]
+    InvalidIdentity,
+    #[error("accepted invitation does not match the expected peer or room")]
+    PeerBindingMismatch,
+    #[error("ICE signaling field has an invalid length")]
+    InvalidFieldLength,
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    WebSocket(#[from] WebSocketError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+    use ed25519_dalek::SigningKey;
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_rustls::TlsConnector;
+    use tokio_tungstenite::client_async;
+
+    use super::{SignalClient, SignalEvent};
+    use crate::{PeerIdentity, server};
+
+    async fn client(
+        address: SocketAddr,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+    ) -> anyhow::Result<
+        SignalClient<
+            tokio_tungstenite::WebSocketStream<
+                tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    > {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate)?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(address).await?;
+        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned())?;
+        let tls = connector.connect(server_name, tcp).await?;
+        let (websocket, _) = client_async("wss://localhost/signal", tls).await?;
+        Ok(SignalClient::from_authenticated_websocket(websocket))
+    }
+
+    #[tokio::test]
+    async fn validated_wss_clients_create_and_accept_identity_bound_invitation()
+    -> anyhow::Result<()> {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let certificate = certified.cert.der().clone();
+        let acceptor = server::tls_acceptor(
+            certified.cert.pem().as_bytes(),
+            certified.signing_key.serialize_pem().as_bytes(),
+        )?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server_task = tokio::spawn(server::serve(listener, acceptor));
+
+        let inviter_key = SigningKey::from_bytes(&[71; 32]);
+        let invitee_key = SigningKey::from_bytes(&[72; 32]);
+        let inviter_identity = PeerIdentity::from_signing_key(&inviter_key);
+        let invitee_identity = PeerIdentity::from_signing_key(&invitee_key);
+        let mut inviter = client(address, certificate.clone()).await?;
+        let invitation = inviter
+            .create_invitation(invitee_identity, &inviter_key)
+            .await?;
+        let mut invitee = client(address, certificate).await?;
+        let accepted = invitee
+            .accept_invitation(
+                invitation.room,
+                &invitation.token,
+                inviter_identity,
+                &invitee_key,
+            )
+            .await?;
+        assert_eq!(accepted.room, invitation.room);
+        assert_eq!(accepted.remote_peer, inviter_identity);
+        let resume_token_json =
+            serde_json::to_string(accepted.credentials.resume_token().expose())?;
+        assert!(!format!("{:?}", accepted.credentials).contains(&resume_token_json));
+
+        assert!(matches!(
+            timeout(Duration::from_secs(2), inviter.receive()).await??,
+            SignalEvent::InvitationAccepted(ack) if ack.remote_peer == invitee_identity
+        ));
+        invitee
+            .send_candidate(invitation.room, "candidate:synthetic-udp".to_owned())
+            .await?;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), inviter.receive()).await??,
+            SignalEvent::Candidate { room, from_peer, candidate }
+                if room == invitation.room && from_peer == invitee_identity && candidate == "candidate:synthetic-udp"
+        ));
+        invitee
+            .send_ice_credentials(
+                invitation.room,
+                "local-ufrag".to_owned(),
+                "local-ice-password-with-22-chars".to_owned(),
+            )
+            .await?;
+        let SignalEvent::IceCredentials {
+            room,
+            from_peer,
+            ufrag,
+            password,
+        } = timeout(Duration::from_secs(2), inviter.receive()).await??
+        else {
+            anyhow::bail!("expected forwarded ICE credentials");
+        };
+        assert_eq!(room, invitation.room);
+        assert_eq!(from_peer, invitee_identity);
+        assert_eq!(ufrag.expose(), "local-ufrag");
+        assert_eq!(password.expose(), "local-ice-password-with-22-chars");
+        assert_eq!(format!("{ufrag:?}"), "[redacted]");
+        invitee.hangup(invitation.room).await?;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), inviter.receive()).await??,
+            SignalEvent::PeerLeft(room) if room == invitation.room
+        ));
+        inviter.close().await?;
+        invitee.close().await?;
+        server_task.abort();
+        Ok(())
+    }
+}

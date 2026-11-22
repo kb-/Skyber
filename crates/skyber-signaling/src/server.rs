@@ -42,9 +42,9 @@ const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(10 * 60);
 
 /// Typed client commands. Signature verification happens before a connection
 /// becomes associated with an identity or room.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum ClientMessage {
+pub(crate) enum ClientMessage {
     CreateInvitation {
         inviter: [u8; 32],
         invitee: [u8; 32],
@@ -83,9 +83,9 @@ enum ClientMessage {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMessage {
+pub(crate) enum ServerMessage {
     InvitationCreated {
         room: [u8; 16],
         token: WireInvitationToken,
@@ -122,11 +122,11 @@ enum ServerMessage {
         room: [u8; 16],
     },
     Error {
-        code: &'static str,
+        code: String,
     },
 }
 
-struct WireInvitationToken([u8; 32]);
+pub(crate) struct WireInvitationToken(pub(crate) [u8; 32]);
 
 impl std::fmt::Debug for WireInvitationToken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -158,7 +158,7 @@ impl Drop for WireInvitationToken {
     }
 }
 
-struct WireSecretString(String);
+pub(crate) struct WireSecretString(pub(crate) String);
 
 impl Serialize for WireSecretString {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -542,7 +542,7 @@ async fn serve_connection(
                     Ok(request) => request,
                     Err(_) => {
                         let _ = outbound.try_send(ServerMessage::Error {
-                            code: "invalid_message",
+                            code: "invalid_message".to_owned(),
                         });
                         break;
                     }
@@ -552,7 +552,7 @@ async fn serve_connection(
                     .is_err()
                 {
                     let _ = outbound.try_send(ServerMessage::Error {
-                        code: "request_rejected",
+                        code: "request_rejected".to_owned(),
                     });
                     break;
                 }
@@ -611,7 +611,7 @@ async fn handle_message(
                 if state.waiting.remove(&room).is_some() {
                     state.invitations.cancel_invitation(room, inviter);
                     let _ = expiration_notice.try_send(ServerMessage::Error {
-                        code: "invitation_expired",
+                        code: "invitation_expired".to_owned(),
                     });
                 }
             });

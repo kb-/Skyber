@@ -325,7 +325,12 @@ impl InvitationRegistry {
     }
 }
 
+pub mod client;
 pub mod server;
+
+pub use client::{
+    AcceptedRoom, PeerCredentials, SecretString, SignalClient, SignalClientError, SignalEvent,
+};
 
 /// Bytes an inviter signs before requesting an invitation.
 pub fn invite_request_message(
