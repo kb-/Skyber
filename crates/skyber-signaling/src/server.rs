@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore, mpsc, oneshot},
+    sync::{Mutex, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -38,6 +38,7 @@ const MAX_RELAY_PACKET_SIZE: usize = 1200;
 const MAX_RELAY_BYTES_PER_SECOND: usize = 8 * 1024 * 1024;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const RELAY_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(10 * 60);
 
 /// Typed client commands. Signature verification happens before a connection
@@ -222,6 +223,7 @@ struct ActiveRoom {
     invitee_relay_hash: [u8; 32],
     inviter_relay: Option<mpsc::Sender<RelayCommand>>,
     invitee_relay: Option<mpsc::Sender<RelayCommand>>,
+    relay_ready: watch::Sender<bool>,
     inviter_relay_quota: RelayQuota,
     invitee_relay_quota: RelayQuota,
     disconnected_until: Option<Instant>,
@@ -393,6 +395,10 @@ async fn serve_relay_connection(
     {
         return;
     }
+    if wait_for_relay_peer(room, &shared).await.is_err() {
+        cleanup_relay(room, peer, &shared).await;
+        return;
+    }
     let ready = match serde_json::to_string(&ServerMessage::RelayReady {
         room: *room.as_bytes(),
     }) {
@@ -461,7 +467,38 @@ async fn register_relay(
         return Err(InvitationError::WrongPeer);
     }
     *slot = Some(relay);
+    if active.inviter_relay.is_some() && active.invitee_relay.is_some() {
+        active.relay_ready.send_replace(true);
+    }
     Ok(())
+}
+
+async fn wait_for_relay_peer(
+    room: RoomId,
+    shared: &Arc<Mutex<SignalState>>,
+) -> Result<(), InvitationError> {
+    let mut ready = {
+        let state = shared.lock().await;
+        state
+            .active
+            .get(&room)
+            .ok_or(InvitationError::NotFound)?
+            .relay_ready
+            .subscribe()
+    };
+    timeout(RELAY_JOIN_TIMEOUT, async {
+        loop {
+            if *ready.borrow() {
+                return Ok(());
+            }
+            ready
+                .changed()
+                .await
+                .map_err(|_| InvitationError::NotFound)?;
+        }
+    })
+    .await
+    .map_err(|_| InvitationError::Expired)?
 }
 
 async fn route_relay_packet(
@@ -510,9 +547,11 @@ async fn cleanup_relay(room: RoomId, peer: PeerIdentity, shared: &Arc<Mutex<Sign
         };
         if active.inviter == peer {
             active.inviter_relay = None;
+            active.relay_ready.send_replace(false);
             active.invitee_relay.clone()
         } else if active.invitee == peer {
             active.invitee_relay = None;
+            active.relay_ready.send_replace(false);
             active.inviter_relay.clone()
         } else {
             None
@@ -684,6 +723,7 @@ async fn handle_message(
                     invitee_relay_hash,
                     inviter_relay: None,
                     invitee_relay: None,
+                    relay_ready: watch::channel(false).0,
                     inviter_relay_quota: RelayQuota::new(),
                     invitee_relay_quota: RelayQuota::new(),
                     disconnected_until: None,
@@ -1233,6 +1273,7 @@ mod tests {
                 invitee_relay_hash: hash_token(&invitee_token),
                 inviter_relay: None,
                 invitee_relay: None,
+                relay_ready: tokio::sync::watch::channel(false).0,
                 inviter_relay_quota: RelayQuota::new(),
                 invitee_relay_quota: RelayQuota::new(),
                 disconnected_until: None,
@@ -1356,6 +1397,7 @@ mod tests {
                 invitee_relay_hash: hash_token(&invitee_token),
                 inviter_relay: None,
                 invitee_relay: None,
+                relay_ready: tokio::sync::watch::channel(false).0,
                 inviter_relay_quota: RelayQuota::new(),
                 invitee_relay_quota: RelayQuota::new(),
                 disconnected_until: None,

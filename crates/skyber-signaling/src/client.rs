@@ -696,20 +696,20 @@ mod tests {
                 if room == invitation.room && from_peer == invitee_identity
         ));
 
-        let mut inviter_relay = RelayClient::join(
-            websocket(address, certificate.clone(), "relay").await?,
-            invitation.room,
-            inviter_accepted.credentials.relay_token(),
-            &inviter_key,
-        )
-        .await?;
-        let mut invitee_relay = RelayClient::join(
-            websocket(address, certificate, "relay").await?,
-            invitation.room,
-            accepted.credentials.relay_token(),
-            &invitee_key,
-        )
-        .await?;
+        let (mut inviter_relay, mut invitee_relay) = tokio::try_join!(
+            RelayClient::join(
+                websocket(address, certificate.clone(), "relay").await?,
+                invitation.room,
+                inviter_accepted.credentials.relay_token(),
+                &inviter_key,
+            ),
+            RelayClient::join(
+                websocket(address, certificate, "relay").await?,
+                invitation.room,
+                accepted.credentials.relay_token(),
+                &invitee_key,
+            ),
+        )?;
         inviter_relay.send_datagram(&[1, 3, 5, 7]).await?;
         assert_eq!(invitee_relay.receive_datagram().await?, [1, 3, 5, 7]);
         invitee_relay.send_datagram(&[2, 4, 6]).await?;

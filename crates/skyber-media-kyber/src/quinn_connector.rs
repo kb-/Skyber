@@ -15,7 +15,63 @@ use futures_util::{Sink, Stream};
 use quinn::{AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig};
 use skyber_signaling::{PeerCredentials, PeerIdentity, RelayClient, RoomId, SignalClient};
 use tokio::sync::watch;
-use tokio_tungstenite::{tungstenite::Error as WebSocketError, tungstenite::Message};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, connect_async_tls_with_config, tungstenite::Error as WebSocketError,
+    tungstenite::Message,
+};
+
+/// WSS connector using an explicitly configured rustls trust store or pin.
+/// TLS roots are supplied by the desktop/platform layer; the default is never
+/// to accept an unvalidated certificate.
+pub struct TlsRelayWebSocketConnector {
+    endpoint: String,
+    tls_config: Arc<rustls::ClientConfig>,
+}
+
+impl TlsRelayWebSocketConnector {
+    pub fn new(
+        endpoint: impl Into<String>,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> Result<Self, String> {
+        let endpoint = endpoint.into();
+        let authority_and_path = endpoint
+            .strip_prefix("wss://")
+            .ok_or_else(|| "relay endpoint must use wss://".to_owned())?;
+        let authority = authority_and_path.split('/').next().unwrap_or_default();
+        if authority.is_empty()
+            || authority.contains('@')
+            || endpoint.contains('?')
+            || endpoint.contains('#')
+            || endpoint.chars().any(char::is_whitespace)
+        {
+            return Err("relay endpoint contains invalid or secret-bearing URL fields".to_owned());
+        }
+        Ok(Self {
+            endpoint,
+            tls_config,
+        })
+    }
+}
+
+impl RelayWebSocketConnector for TlsRelayWebSocketConnector {
+    type WebSocket = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+    type ConnectFuture<'a> =
+        Pin<Box<dyn Future<Output = Result<Self::WebSocket, String>> + Send + 'a>>;
+
+    fn connect(&mut self) -> Self::ConnectFuture<'_> {
+        Box::pin(async move {
+            let (websocket, _) = connect_async_tls_with_config(
+                self.endpoint.as_str(),
+                None,
+                true,
+                Some(Connector::Rustls(Arc::clone(&self.tls_config))),
+            )
+            .await
+            .map_err(|error| format!("WSS relay connection failed: {error}"))?;
+            Ok(websocket)
+        })
+    }
+}
 
 /// Opens a separately authenticated WSS relay connection. Implementations
 /// own the platform CA or explicit service-pin policy for that connection.
@@ -383,23 +439,32 @@ mod tests {
     }
     impl<T> Pipe for T {}
 
-    struct TestWssConnector {
-        address: SocketAddr,
-        certificate: rustls::pki_types::CertificateDer<'static>,
-    }
+    struct TestWssConnector(super::TlsRelayWebSocketConnector);
 
     impl RelayWebSocketConnector for TestWssConnector {
-        type WebSocket = WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+        type WebSocket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
         type ConnectFuture<'a> =
             std::pin::Pin<Box<dyn Future<Output = Result<Self::WebSocket, String>> + Send + 'a>>;
 
         fn connect(&mut self) -> Self::ConnectFuture<'_> {
-            Box::pin(async move {
-                connect_wss(self.address, self.certificate.clone(), "relay")
-                    .await
-                    .map_err(|error| error.to_string())
-            })
+            Box::pin(self.0.connect())
         }
+    }
+
+    fn relay_wss_connector(
+        address: SocketAddr,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+    ) -> anyhow::Result<TestWssConnector> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate)?;
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let endpoint = format!("wss://localhost:{}/relay", address.port());
+        Ok(TestWssConnector(
+            super::TlsRelayWebSocketConnector::new(endpoint, Arc::new(tls_config))
+                .map_err(anyhow::Error::msg)?,
+        ))
     }
 
     async fn connect_wss(
@@ -515,6 +580,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn tls_relay_connector_rejects_cleartext_and_secret_bearing_urls() {
+        let tls = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        assert!(
+            super::TlsRelayWebSocketConnector::new("ws://relay.example/relay", tls.clone())
+                .is_err()
+        );
+        assert!(
+            super::TlsRelayWebSocketConnector::new(
+                "wss://user:password@relay.example/relay",
+                tls.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            super::TlsRelayWebSocketConnector::new(
+                "wss://relay.example/relay?token=secret",
+                tls.clone(),
+            )
+            .is_err()
+        );
+        assert!(super::TlsRelayWebSocketConnector::new("wss://relay.example/relay", tls).is_ok());
+    }
+
     #[tokio::test]
     async fn typed_signaling_provider_falls_back_to_authenticated_wss_and_authenticates()
     -> anyhow::Result<()> {
@@ -560,14 +653,13 @@ mod tests {
             invitee: invitee_peer,
         };
         let (client_config, server_config) = quic_configs()?;
+        let inviter_relay_connector = relay_wss_connector(address, certificate.clone())?;
+        let invitee_relay_connector = relay_wss_connector(address, certificate.clone())?;
         let (_cancel_inviter, mut cancel_inviter) = watch::channel(false);
         let (_cancel_invitee, mut cancel_invitee) = watch::channel(false);
         let inviter_provider = SignalingPathSocketProvider::new(
             inviter_signaling,
-            TestWssConnector {
-                address,
-                certificate: certificate.clone(),
-            },
+            inviter_relay_connector,
             inviter_room,
             inviter_key.clone(),
             true,
@@ -576,10 +668,7 @@ mod tests {
         );
         let invitee_provider = SignalingPathSocketProvider::new(
             invitee_signaling,
-            TestWssConnector {
-                address,
-                certificate,
-            },
+            invitee_relay_connector,
             invitee_room,
             invitee_key.clone(),
             false,
