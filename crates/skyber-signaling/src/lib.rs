@@ -14,6 +14,9 @@ const INVITE_DOMAIN: &[u8] = b"skyber/c1/invite/v1\0";
 const ACCEPT_DOMAIN: &[u8] = b"skyber/c1/accept/v1\0";
 const RESUME_DOMAIN: &[u8] = b"skyber/c1/resume/v1\0";
 const RELAY_DOMAIN: &[u8] = b"skyber/c1/relay/v1\0";
+const INVITATION_CODE_PREFIX: &str = "skyber-invite-v1|";
+const MAX_INVITATION_ENDPOINT_LENGTH: usize = 1024;
+const MAX_INVITATION_CODE_LENGTH: usize = 1280;
 const DEFAULT_INVITE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_REQUEST_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_INVITES_PER_WINDOW: usize = 5;
@@ -36,6 +39,11 @@ impl PeerIdentity {
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Stable hexadecimal representation for explicit peer identity checks.
+    pub fn fingerprint(&self) -> String {
+        hex_fingerprint(&self.0)
     }
 
     fn verifying_key(&self) -> Result<VerifyingKey, InvitationError> {
@@ -89,6 +97,257 @@ pub struct Invitation {
     pub room: RoomId,
     pub token: InvitationToken,
     pub expires_in: Duration,
+}
+
+/// Explicitly shareable invitation data. Its text form contains the one-use
+/// bearer ticket, so callers should reveal it only through a deliberate share
+/// action and should never log or persist it by default.
+pub struct InvitationShareCode {
+    endpoint: String,
+    room: RoomId,
+    token: InvitationToken,
+    inviter: PeerIdentity,
+    invitee: PeerIdentity,
+}
+
+impl InvitationShareCode {
+    /// Build a share code for a validated WSS signaling endpoint.
+    pub fn new(
+        endpoint: impl Into<String>,
+        invitation: &Invitation,
+        inviter: PeerIdentity,
+        invitee: PeerIdentity,
+    ) -> Result<Self, InvitationCodeError> {
+        let endpoint = endpoint.into();
+        validate_invitation_endpoint(&endpoint)?;
+        if inviter == invitee {
+            return Err(InvitationCodeError::InvalidIdentity);
+        }
+        let mut token = [0_u8; 32];
+        token.copy_from_slice(invitation.token.expose());
+        Ok(Self {
+            endpoint,
+            room: invitation.room,
+            token: InvitationToken(token),
+            inviter,
+            invitee,
+        })
+    }
+
+    /// Parse a bounded versioned code pasted by the invited peer.
+    pub fn parse(text: &str) -> Result<Self, InvitationCodeError> {
+        if text.len() > MAX_INVITATION_CODE_LENGTH {
+            return Err(InvitationCodeError::TooLong);
+        }
+        let body = text
+            .strip_prefix(INVITATION_CODE_PREFIX)
+            .ok_or(InvitationCodeError::UnsupportedVersion)?;
+        let mut fields = body.split('|');
+        let endpoint = fields.next().ok_or(InvitationCodeError::Malformed)?;
+        let room = fields.next().ok_or(InvitationCodeError::Malformed)?;
+        let token = fields.next().ok_or(InvitationCodeError::Malformed)?;
+        let inviter = fields.next().ok_or(InvitationCodeError::Malformed)?;
+        let invitee = fields.next().ok_or(InvitationCodeError::Malformed)?;
+        if fields.next().is_some() {
+            return Err(InvitationCodeError::Malformed);
+        }
+        validate_invitation_endpoint(endpoint)?;
+
+        let room = RoomId::from_bytes(decode_hex::<16>(room)?);
+        let token = InvitationToken(decode_hex::<32>(token)?);
+        let inviter = PeerIdentity::from_bytes(decode_hex::<32>(inviter)?)
+            .map_err(|_| InvitationCodeError::InvalidIdentity)?;
+        let invitee = PeerIdentity::from_bytes(decode_hex::<32>(invitee)?)
+            .map_err(|_| InvitationCodeError::InvalidIdentity)?;
+        if inviter == invitee {
+            return Err(InvitationCodeError::InvalidIdentity);
+        }
+        Ok(Self {
+            endpoint: endpoint.to_owned(),
+            room,
+            token,
+            inviter,
+            invitee,
+        })
+    }
+
+    /// Return the bearer code for explicit display or clipboard sharing.
+    pub fn expose_text(&self) -> String {
+        format!(
+            "{INVITATION_CODE_PREFIX}{}|{}|{}|{}|{}",
+            self.endpoint,
+            encode_hex(self.room.as_bytes()),
+            encode_hex(self.token.expose()),
+            encode_hex(self.inviter.as_bytes()),
+            encode_hex(self.invitee.as_bytes()),
+        )
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub const fn room(&self) -> RoomId {
+        self.room
+    }
+
+    pub const fn token(&self) -> &InvitationToken {
+        &self.token
+    }
+
+    pub const fn inviter(&self) -> PeerIdentity {
+        self.inviter
+    }
+
+    pub const fn invitee(&self) -> PeerIdentity {
+        self.invitee
+    }
+
+    /// Refuse acceptance unless the code names this local identity.
+    pub fn validate_recipient(&self, local_peer: PeerIdentity) -> Result<(), InvitationCodeError> {
+        if self.invitee == local_peer {
+            Ok(())
+        } else {
+            Err(InvitationCodeError::WrongRecipient)
+        }
+    }
+}
+
+impl std::fmt::Debug for InvitationShareCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InvitationShareCode")
+            .field("endpoint", &self.endpoint)
+            .field("room", &self.room)
+            .field("token", &"[redacted]")
+            .field("inviter", &self.inviter)
+            .field("invitee", &self.invitee)
+            .finish()
+    }
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum InvitationCodeError {
+    #[error("invitation code exceeds its maximum length")]
+    TooLong,
+    #[error("invitation code version is not supported")]
+    UnsupportedVersion,
+    #[error("invitation code is malformed")]
+    Malformed,
+    #[error(
+        "invitation endpoint must be a bounded wss:// URL without credentials, query, or fragment"
+    )]
+    InvalidEndpoint,
+    #[error("invitation contains an invalid peer identity")]
+    InvalidIdentity,
+    #[error("invitation is addressed to a different local identity")]
+    WrongRecipient,
+}
+
+fn validate_invitation_endpoint(endpoint: &str) -> Result<(), InvitationCodeError> {
+    let authority_and_path = endpoint
+        .strip_prefix("wss://")
+        .ok_or(InvitationCodeError::InvalidEndpoint)?;
+    let authority = authority_and_path.split('/').next().unwrap_or_default();
+    if endpoint.len() > MAX_INVITATION_ENDPOINT_LENGTH
+        || endpoint.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '?' | '#' | '|' | '\\')
+        })
+        || !valid_authority(authority)
+    {
+        return Err(InvitationCodeError::InvalidEndpoint);
+    }
+    Ok(())
+}
+
+fn valid_authority(authority: &str) -> bool {
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((address, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        let port = if suffix.is_empty() {
+            None
+        } else if let Some(port) = suffix.strip_prefix(':') {
+            Some(port)
+        } else {
+            return false;
+        };
+        (address, port)
+    } else {
+        let mut parts = authority.split(':');
+        let host = parts.next().unwrap_or_default();
+        let port = parts.next();
+        if parts.next().is_some() {
+            return false;
+        }
+        (host, port)
+    };
+    let valid_host = if host.parse::<std::net::Ipv4Addr>().is_ok()
+        || host.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        true
+    } else {
+        !host.is_empty()
+            && host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label.as_bytes()[0].is_ascii_alphanumeric()
+                    && label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+    };
+    valid_host
+        && port.is_none_or(|value| {
+            !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value.parse::<u16>().is_ok_and(|port| port != 0)
+        })
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], InvitationCodeError> {
+    if text.len() != N * 2 {
+        return Err(InvitationCodeError::Malformed);
+    }
+    let mut output = [0_u8; N];
+    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(chunk[0]).ok_or(InvitationCodeError::Malformed)?;
+        let low = hex_nibble(chunk[1]).ok_or(InvitationCodeError::Malformed)?;
+        output[index] = (high << 4) | low;
+    }
+    Ok(output)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl std::fmt::Debug for Invitation {
@@ -400,7 +659,8 @@ mod tests {
     use ed25519_dalek::{Signature, Signer, SigningKey};
 
     use super::{
-        AuthenticatedPeers, InvitationError, InvitationRegistry, PeerIdentity, accept_message,
+        AuthenticatedPeers, Invitation, InvitationCodeError, InvitationError, InvitationRegistry,
+        InvitationShareCode, InvitationToken, PeerIdentity, RoomId, accept_message,
         invite_request_message,
     };
 
@@ -560,5 +820,102 @@ mod tests {
             .create_invitation(identity, identity, nonce, &signature)
             .err();
         assert_eq!(error, Some(InvitationError::WrongPeer));
+    }
+
+    #[test]
+    fn invitation_share_code_round_trips_and_binds_recipient() {
+        let (_, _, inviter, invitee) = identities();
+        let invitation = Invitation {
+            room: RoomId::from_bytes([4; 16]),
+            token: InvitationToken([5; 32]),
+            expires_in: Duration::from_secs(120),
+        };
+        let code = InvitationShareCode::new(
+            "wss://calls.example.test/signal",
+            &invitation,
+            inviter,
+            invitee,
+        )
+        .expect("valid invite should create a share code");
+        let text = code.expose_text();
+        let parsed = InvitationShareCode::parse(&text).expect("share code should parse");
+
+        assert_eq!(parsed.endpoint(), "wss://calls.example.test/signal");
+        assert_eq!(parsed.room(), invitation.room);
+        assert_eq!(parsed.token().expose(), invitation.token.expose());
+        assert_eq!(parsed.inviter(), inviter);
+        assert_eq!(parsed.invitee(), invitee);
+        assert_eq!(parsed.inviter().fingerprint().len(), 64);
+        assert_eq!(parsed.validate_recipient(invitee), Ok(()));
+        assert_eq!(
+            parsed.validate_recipient(PeerIdentity::from_signing_key(&key(33))),
+            Err(InvitationCodeError::WrongRecipient),
+        );
+        assert!(!format!("{parsed:?}").contains(&text));
+        assert!(!format!("{parsed:?}").contains(&"05".repeat(32)));
+    }
+
+    #[test]
+    fn invitation_share_code_rejects_unsafe_or_malformed_input() {
+        let (_, _, inviter, invitee) = identities();
+        for endpoint in [
+            "ws://calls.example.test",
+            "wss://user@calls.example.test",
+            "wss://calls.example.test/?secret=value",
+            "wss://calls.example.test/#fragment",
+            "wss://calls.example.test:99999",
+            "wss://bad_host.example.test",
+            "wss://calls.example.test\\other",
+        ] {
+            let invitation = Invitation {
+                room: RoomId::from_bytes([4; 16]),
+                token: InvitationToken([5; 32]),
+                expires_in: Duration::from_secs(120),
+            };
+            assert!(matches!(
+                InvitationShareCode::new(endpoint, &invitation, inviter, invitee),
+                Err(InvitationCodeError::InvalidEndpoint),
+            ));
+        }
+        assert!(matches!(
+            InvitationShareCode::parse("skyber-invite-v2|wss://calls.example.test"),
+            Err(InvitationCodeError::UnsupportedVersion),
+        ));
+        assert!(matches!(
+            InvitationShareCode::parse("skyber-invite-v1|wss://calls.example.test|bad"),
+            Err(InvitationCodeError::Malformed),
+        ));
+        assert!(matches!(
+            InvitationShareCode::parse(&"x".repeat(1281)),
+            Err(InvitationCodeError::TooLong),
+        ));
+    }
+
+    #[test]
+    fn invitation_share_code_accepts_ipv6_and_rejects_self_invitation() {
+        let (inviter_key, _, inviter, invitee) = identities();
+        let invitation = Invitation {
+            room: RoomId::from_bytes([4; 16]),
+            token: InvitationToken([5; 32]),
+            expires_in: Duration::from_secs(120),
+        };
+        assert!(
+            InvitationShareCode::new(
+                "wss://[2001:db8::1]:443/signal",
+                &invitation,
+                inviter,
+                invitee,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            InvitationShareCode::new(
+                "wss://calls.example.test",
+                &invitation,
+                PeerIdentity::from_signing_key(&inviter_key),
+                PeerIdentity::from_signing_key(&inviter_key),
+            ),
+            Err(InvitationCodeError::InvalidIdentity),
+        ));
     }
 }
