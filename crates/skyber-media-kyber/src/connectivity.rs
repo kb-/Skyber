@@ -28,6 +28,7 @@ const PROBE_SIZE: usize = PROBE_HEADER_SIZE + PROBE_PAYLOAD_SIZE;
 const AUTH_OK: u8 = 0xA1;
 const AUTH_REJECTED: u8 = 0x00;
 const EXCHANGE_ACK: u8 = 0xA2;
+const SHUTDOWN_ACK: u8 = 0xA3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_WAIT: Duration = Duration::from_secs(15 * 60);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -193,23 +194,27 @@ pub async fn connect_and_probe(
     let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
         send.write_all(&[EXCHANGE_ACK]).await?;
         send.flush().await?;
+        let ack = read_fixed::<1, _>(
+            &mut receive,
+            SHUTDOWN_TIMEOUT,
+            "shutdown acknowledgment timed out",
+        )
+        .await?;
+        ensure!(
+            ack[0] == SHUTDOWN_ACK,
+            "invalid Gate C-0 shutdown acknowledgment"
+        );
         Ok::<(), anyhow::Error>(())
     })
     .await
     .context("Gate C-0 shutdown timed out");
     if exchange_result.is_err() || shutdown_result.is_err() {
         connection.close(1, "Gate C-0 probe failed");
-    }
-    let close_result = if exchange_result.is_ok() && shutdown_result.is_ok() {
-        tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.closed())
-            .await
-            .context("Gate C-0 shutdown timed out")
     } else {
-        Ok(Ok(()))
-    };
+        connection.close(0, "Gate C-0 probe complete");
+    }
     exchange_result??;
     shutdown_result??;
-    close_result??;
     Ok(())
 }
 
@@ -280,13 +285,22 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
                 ack[0] == EXCHANGE_ACK,
                 "invalid Gate C-0 exchange acknowledgment"
             );
-            raw.close(0, "Gate C-0 probe complete");
+            send.write_all(&[SHUTDOWN_ACK]).await?;
+            send.flush().await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
         .context("Gate C-0 shutdown timed out");
+        let close_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, raw.closed())
+            .await
+            .context("Gate C-0 shutdown timed out")
+            .map_err(|_| anyhow::anyhow!("Gate C-0 shutdown timed out"))
+            .and_then(|result| {
+                result.map_err(|_| anyhow::anyhow!("Gate C-0 peer shutdown failed"))
+            });
         exchange_result??;
         shutdown_result??;
+        close_result?;
         Ok::<(), anyhow::Error>(())
     })
     .await
