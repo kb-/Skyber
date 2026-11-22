@@ -3,6 +3,8 @@
 **Status:** In progress; C-1a transport proofs and an authenticated signaling/relay service foundation are implemented. C-1c path policy exists as a tested pure state machine, but the desktop call flow is not integrated.
 **Scope:** one-to-one IPv4 calls over direct UDP with an authenticated relay fallback. IPv6 remains a full Gate C requirement and is outside this MVP.
 
+**Media architecture pivot (2026-11-22):** Before implementing the production audio/video path, follow [PLAN_KYBER_MEDIA_REALIGNMENT.md](../PLAN_KYBER_MEDIA_REALIGNMENT.md). Reuse Kyber's optimized media pipeline wherever possible, audit upstream-recommended media modes, and expose supported per-track protocol choices until measurements justify defaults. Preserve existing C-1 transport/signaling work and the documented upstream parser-risk exposure policy.
+
 ## Decisions
 
 - Retain Kyber as the media and encrypted data transport. ICE is used only to discover and nominate a network path.
@@ -38,7 +40,7 @@ The `path_policy` module now defines tested call setup order (direct UDP, then W
 
 ### C-1d — Desktop call and protected media
 
-Add Qt call controls and video presentation. Keep business logic in Rust/core and the Qt bridge; QML remains presentation-focused. Integrate the authenticated room-to-QUIC session binding before activating Kyber media endpoints. Use synthetic media for repeatable Internet transport tests. Live-media trials with the unmodified upstream parser, if undertaken, require an explicitly authorized, isolated test between known participants, documented risk acceptance, and bounded process resources; authentication and resource limits reduce exposure but do not fix the underlying allocation risk. No unattended public-beta or arbitrary-peer Internet media exposure should be presented as safe while the upstream issue remains unresolved.
+Add Qt call controls and video presentation. Keep business logic in Rust/core and the Qt bridge; QML remains presentation-focused. Integrate the authenticated room-to-QUIC session binding before activating Kyber media endpoints. Before choosing the **production** capture, codec, media-protocol and playback path, complete the upstream-first comparison and reference proof in [the Kyber media realignment plan](../PLAN_KYBER_MEDIA_REALIGNMENT.md). Offer selectable supported per-track media modes (with negotiation and diagnostics), rather than locking the A1/A2 reliable-only prototype into the product. Use synthetic media for repeatable Internet transport tests. Live-media trials with the unmodified upstream parser, if undertaken, require an explicitly authorized, isolated test between known participants, documented risk acceptance, and bounded process resources; authentication and resource limits reduce exposure but do not fix the underlying allocation risk. No unattended public-beta or arbitrary-peer Internet media exposure should be presented as safe while the upstream issue remains unresolved.
 
 ### C-1e — Acceptance
 
