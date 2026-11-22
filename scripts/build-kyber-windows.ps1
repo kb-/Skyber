@@ -112,6 +112,11 @@ if [ ! -f "$rootfs/lib/libkyclient.a" ] || [ ! -f "$rootfs/bin/kyclient.dll" ]; 
   ./build-win32.sh -s -o "$rootfs" build-kyclient
 fi
 test -f "$rootfs/lib/libkyclient.a"
+for runtime in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+  runtime_path="$(x86_64-w64-mingw32-gcc -print-file-name="$runtime")"
+  test -f "$runtime_path"
+  install -m 755 "$runtime_path" "$rootfs/bin/$runtime"
+done
 find "$rootfs" -maxdepth 3 -type f -print | sort > /tmp/skyber-kyber-windows-artifacts.txt
 '@
 
