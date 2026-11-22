@@ -143,6 +143,11 @@ impl<C: CallPathConnector> CallController<C> {
         self.active.as_ref()
     }
 
+    /// Access adapter configuration for the next path attempt or recovery.
+    pub fn connector_mut(&mut self) -> &mut C {
+        &mut self.connector
+    }
+
     async fn connect_attempt(
         &mut self,
         attempt: PathAttempt,

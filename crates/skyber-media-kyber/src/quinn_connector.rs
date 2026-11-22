@@ -125,6 +125,11 @@ impl<S, W> SignalingPathSocketProvider<S, W> {
             cancellation,
         }
     }
+
+    /// Replace STUN endpoints used by a later direct-path attempt.
+    pub fn set_stun_server_urls(&mut self, urls: Vec<String>) {
+        self.stun_server_urls = urls;
+    }
 }
 
 impl<S, W> CallPathSocketProvider for SignalingPathSocketProvider<S, W>
@@ -353,6 +358,10 @@ impl<P> QuinnCallPathConnector<P> {
 
     pub const fn is_inviter(&self) -> bool {
         self.is_inviter
+    }
+
+    pub fn provider_mut(&mut self) -> &mut P {
+        &mut self.provider
     }
 }
 
@@ -731,6 +740,24 @@ mod tests {
         )
         .await??;
         anyhow::ensure!(&acknowledgement == b"ok", "Kyber response was not received");
+
+        inviter
+            .connector_mut()
+            .provider_mut()
+            .set_stun_server_urls(Vec::new());
+        invitee
+            .connector_mut()
+            .provider_mut()
+            .set_stun_server_urls(Vec::new());
+        let (inviter_reconnected, invitee_reconnected) = timeout(Duration::from_secs(35), async {
+            tokio::try_join!(
+                inviter.reconnect(&mut cancel_inviter),
+                invitee.reconnect(&mut cancel_invitee),
+            )
+        })
+        .await??;
+        assert_eq!(inviter_reconnected.path(), NetworkPath::DirectUdp);
+        assert_eq!(invitee_reconnected.path(), NetworkPath::DirectUdp);
 
         inviter.hangup();
         invitee.hangup();
