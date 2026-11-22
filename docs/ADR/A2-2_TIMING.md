@@ -84,7 +84,7 @@ instrumentation result and does not close the A2-2 gate.
 ### LAN connection-stat smoke run
 
 A separate eight-second synthetic screen-stop call ran over Wi-Fi between
-Windows 11 (`192.168.1.30`) and Ubuntu 26.04.1 (`192.168.1.36`). Both
+a Windows 11 host and an Ubuntu 26.04.1 guest. Both
 peers emitted nine RTT samples, and each reported a zero change in the
 cumulative QUIC lost-packet counter. Windows RTT p50/p95 was 3,802 / 5,314
 µs; Ubuntu RTT p50/p95 was 3,554 / 10,820 µs. These are each peer's QUIC

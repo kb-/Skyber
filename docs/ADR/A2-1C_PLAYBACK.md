@@ -74,8 +74,8 @@ decoded output and per-track viewer lifetime.
 
 ## Cross-host live verification on November 21, 2026
 
-The Windows 11 PC (`192.168.1.30`) and Ubuntu 26.04.1 LTS VirtualBox
-guest (`192.168.1.36`) exchanged live media over Wi-Fi. Ubuntu initiated
+The Windows 11 PC and Ubuntu 26.04.1 LTS VirtualBox guest exchanged live
+media over Wi-Fi. Ubuntu initiated
 each authenticated Kyber connection and Windows listened. Both capture
 directions delivered live microphone and camera packets, and the
 receiving platform reported the matching decoded playback bytes.

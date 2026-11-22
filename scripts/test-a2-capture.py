@@ -35,15 +35,18 @@ def main() -> None:
         parser.error("--acceptance requires --duration-ms 900000")
     if args.acceptance and args.cancel_screen:
         parser.error("--acceptance cannot be combined with --cancel-screen")
+    with_screen = args.with_screen or args.cancel_screen
+    try:
+        run_duration_ms = capture_run_duration_ms(args.duration_ms, with_screen)
+    except ValueError as error:
+        parser.error(str(error))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     run = args.output / stamp
     run.mkdir(parents=True)
     suite = runpy.run_path(str(Path(__file__).with_name("test-a1.py")))
     print(f"A2-1 capture results directory {run}", flush=True)
-    with_screen = args.with_screen or args.cancel_screen
     if args.acceptance:
         os.environ["SKYBER_AUDIO_DIAGNOSTICS"] = "1"
-    run_duration_ms = args.duration_ms + (6000 if with_screen else 0)
     if args.cancel_screen:
         print("Cancel the screen capture picker without selecting a source.", flush=True)
     elif with_screen:
@@ -92,6 +95,17 @@ def main() -> None:
                           "failures": failures}, sort_keys=True), flush=True)
         if failures:
             raise RuntimeError("15-minute live audio continuity acceptance failed")
+
+
+def capture_run_duration_ms(active_duration_ms: int, with_screen: bool) -> int:
+    """Include the screen-picker grace period without exceeding the peer limit."""
+    run_duration_ms = active_duration_ms + (6000 if with_screen else 0)
+    if run_duration_ms > 900_000:
+        raise ValueError(
+            "screen capture duration plus its 6000 ms startup allowance "
+            "must not exceed the 900000 ms peer limit"
+        )
+    return run_duration_ms
 
 
 def audio_continuity_report(duration_ms: int, helper: dict | None,

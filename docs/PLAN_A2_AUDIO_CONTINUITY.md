@@ -1,6 +1,6 @@
 # Plan — Investigate long-call audio continuity without 4G
 
-**Status:** Investigation plan, not a completed fix. Prepared against Skyber A2-2 commit 99a6960 (2026-11-22).
+**Status:** Investigation paused with the VirtualBox USB capture limitation documented; no Skyber fix confirmed (2026-11-22). The plan below records the investigation approach and remains useful if device or environment evidence changes.
 **Scope:** Windows 11 + Ubuntu 26.04.1 LTS in VirtualBox, on one host or two separate PCs over the existing home LAN. **No cellular connection, OpenVPN, public IP, or Internet access is required to reproduce or fix the defect.**
 **Related:** [A2-2 timing evidence](ADR/A2-2_TIMING.md), [A2 development plan](PLAN_GATE_A2.md), [test policy](TESTING.md), [native capture adapters](ADR/A2-1A_WINDOWS_CAPTURE.md) and [Ubuntu capture adapter](ADR/A2-1B_UBUNTU_CAPTURE.md).
 

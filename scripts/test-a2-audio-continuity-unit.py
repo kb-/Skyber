@@ -14,6 +14,7 @@ capture_acceptance_failures = HARNESS["capture_acceptance_failures"]
 CAPTURE = runpy.run_path("scripts/test-a2-capture.py")
 audio_continuity_report = CAPTURE["audio_continuity_report"]
 summarize_gaps = CAPTURE["summarize_gaps"]
+capture_run_duration_ms = CAPTURE["capture_run_duration_ms"]
 
 
 class ShortReadStream(io.BytesIO):
@@ -31,6 +32,18 @@ class CaptureRecordTests(unittest.TestCase):
     def test_read_exact_rejects_truncated_record(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "truncated capture record"):
             read_exact(io.BytesIO(b"abc"), 8)
+
+
+class CaptureDurationTests(unittest.TestCase):
+    def test_screen_allowance_stays_within_peer_duration_limit(self) -> None:
+        self.assertEqual(capture_run_duration_ms(894_000, True), 900_000)
+
+    def test_screen_allowance_rejects_duration_over_peer_limit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "900000 ms peer limit"):
+            capture_run_duration_ms(894_001, True)
+
+    def test_non_screen_capture_uses_requested_duration(self) -> None:
+        self.assertEqual(capture_run_duration_ms(900_000, False), 900_000)
 
 
 class CaptureAcceptanceTests(unittest.TestCase):

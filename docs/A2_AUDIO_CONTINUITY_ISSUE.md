@@ -1,6 +1,7 @@
 # A2 audio continuity issue
 
-**Status:** Open; root cause and remediation are not confirmed. Updated 2026-11-22.
+**Status:** Investigation paused with an environment-specific VirtualBox USB
+capture limitation recorded; no Skyber audio fix is confirmed. Updated 2026-11-22.
 
 ## Symptoms
 
@@ -45,6 +46,13 @@ Windows host's USB controller, VirtualBox USB passthrough, or the Ubuntu
 guest's device/kernel path. It also does not establish acoustic speaker output
 or prove that the original two-direction call's capture sources were the same
 as those in the later C922 tests. No audio-capture or codec fix is confirmed.
+
+The investigation is closed for now because direct C922 capture remains
+unreliable in this VirtualBox setup, while the onboard Ubuntu microphone
+completed the 15-minute loopback with 44,929 Opus packets and 99.951% provider
+coverage. Continue Ubuntu synthetic-media testing. Keep sustained, loaded-call
+audio quality open as a product validation item; these results do not establish
+that long-call audio is fixed across devices or environments.
 
 ## VirtualBox USB 2.0 retest (2026-11-22)
 
