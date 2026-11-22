@@ -269,6 +269,9 @@ mod tests {
     };
 
     use super::{IceQuinnSocket, MAX_PACKET_SIZE, PACKET_CAPACITY};
+    use crate::room_auth::authenticate_room;
+    use ed25519_dalek::SigningKey;
+    use skyber_signaling::{AuthenticatedPeers, PeerIdentity, RoomId};
     use std::{io::IoSliceMut, task::Poll};
 
     #[tokio::test]
@@ -334,8 +337,19 @@ mod tests {
         .await
         .context("ICE-backed QUIC handshake timed out")??;
 
-        let client = kymux::kynet::Connection::from(client_quic);
-        let server = kymux::kynet::Connection::from(server_quic);
+        let inviter_key = SigningKey::from_bytes(&[11; 32]);
+        let invitee_key = SigningKey::from_bytes(&[22; 32]);
+        let peers = AuthenticatedPeers {
+            room: RoomId::from_bytes([7; 16]),
+            inviter: PeerIdentity::from_signing_key(&inviter_key),
+            invitee: PeerIdentity::from_signing_key(&invitee_key),
+        };
+        let (client_quic, server_quic) = tokio::try_join!(
+            authenticate_room(client_quic, peers, &inviter_key),
+            authenticate_room(server_quic, peers, &invitee_key),
+        )?;
+        let client = kymux::kynet::Connection::from(client_quic.into_inner());
+        let server = kymux::kynet::Connection::from(server_quic.into_inner());
         let (mut client_send, mut client_receive) = client.open_bi().await?;
         client_send.write_all(b"ice-quinn-kymux").await?;
         client_send.finish().await?;
@@ -441,8 +455,19 @@ mod tests {
         .await
         .context("WebSocket QUIC handshake timed out")??;
 
-        let client = kymux::kynet::Connection::from(client_quic);
-        let server = kymux::kynet::Connection::from(server_quic);
+        let inviter_key = SigningKey::from_bytes(&[11; 32]);
+        let invitee_key = SigningKey::from_bytes(&[22; 32]);
+        let peers = AuthenticatedPeers {
+            room: RoomId::from_bytes([7; 16]),
+            inviter: PeerIdentity::from_signing_key(&inviter_key),
+            invitee: PeerIdentity::from_signing_key(&invitee_key),
+        };
+        let (client_quic, server_quic) = tokio::try_join!(
+            authenticate_room(client_quic, peers, &inviter_key),
+            authenticate_room(server_quic, peers, &invitee_key),
+        )?;
+        let client = kymux::kynet::Connection::from(client_quic.into_inner());
+        let server = kymux::kynet::Connection::from(server_quic.into_inner());
         let (mut client_send, mut client_receive) = client.open_bi().await?;
         const SYNTHETIC_SIZE: usize = 256 * 1024;
         let synthetic = vec![0x5A_u8; SYNTHETIC_SIZE];
