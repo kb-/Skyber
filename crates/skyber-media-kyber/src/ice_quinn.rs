@@ -46,7 +46,7 @@ impl IceQuinnSocket {
     /// Bridge a connected ICE transport into Quinn's synchronous UDP socket API.
     pub fn new<I>(ice: Arc<I>) -> io::Result<Arc<Self>>
     where
-        I: Conn + Send + Sync + 'static,
+        I: Conn + Send + Sync + 'static + ?Sized,
     {
         let local_addr = ice
             .local_addr()
