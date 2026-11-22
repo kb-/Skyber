@@ -6,6 +6,7 @@ import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import secrets
 import socket
@@ -53,12 +54,125 @@ def process_cpu_ms(pid: int) -> float:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
         created, exited, system, user = [wintypes.FILETIME() for _ in range(4)]
-        if not kernel.GetProcessTimes(process, created, exited, system, user):
+        if not kernel.GetProcessTimes(
+            process, *(ctypes.byref(value) for value in (created, exited, system, user))
+        ):
             raise ctypes.WinError(ctypes.get_last_error())
         ticks = sum((t.dwHighDateTime << 32) | t.dwLowDateTime for t in (system, user))
         return ticks / 10_000
     finally:
         kernel.CloseHandle(process)
+
+
+def process_resource_sample(pid: int) -> tuple[int, int, int]:
+    """Return process CPU microseconds, resident bytes, and peak resident bytes."""
+    if sys.platform == "win32":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+            ctypes.POINTER(wintypes.FILETIME)
+        ] * 4
+        kernel.GetProcessTimes.restype = wintypes.BOOL
+
+        class ProcessMemoryCountersEx(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(ProcessMemoryCountersEx), wintypes.DWORD
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        process = kernel.OpenProcess(0x1000 | 0x0010, False, pid)
+        if not process:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            created, exited, system, user = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel.GetProcessTimes(
+                process, *(ctypes.byref(value) for value in (created, exited, system, user))
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            ticks = sum((t.dwHighDateTime << 32) | t.dwLowDateTime for t in (system, user))
+            counters = ProcessMemoryCountersEx()
+            counters.cb = ctypes.sizeof(counters)
+            if not psapi.GetProcessMemoryInfo(process, ctypes.byref(counters), counters.cb):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return ticks // 10, counters.WorkingSetSize, counters.PeakWorkingSetSize
+        finally:
+            kernel.CloseHandle(process)
+
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    fields = stat[stat.rfind(")") + 2:].split()
+    ticks = int(fields[11]) + int(fields[12])  # utime and stime, fields 14 and 15.
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    memory = {line.split(":", 1)[0]: int(line.split()[1]) * 1024
+              for line in status.splitlines()
+              if line.startswith(("VmRSS:", "VmHWM:"))}
+    return ticks * 1_000_000 // ticks_per_second, memory["VmRSS"], memory["VmHWM"]
+
+
+def monitor_processes(
+    processes: dict[str, subprocess.Popen[bytes]], timeout: float, interval: float = 0.5,
+) -> dict[str, list[dict[str, int]]]:
+    """Wait for peer processes while sampling their local CPU and memory use."""
+    origin = time.monotonic_ns()
+    samples: dict[str, list[dict[str, int]]] = {role: [] for role in processes}
+    observed_peak_resident = {role: 0 for role in processes}
+    next_sample = 0.0
+    deadline = time.monotonic() + timeout
+    while any(peer.poll() is None for peer in processes.values()):
+        elapsed_us = (time.monotonic_ns() - origin) // 1000
+        if elapsed_us / 1_000_000 >= next_sample:
+            for role, peer in processes.items():
+                if peer.poll() is not None:
+                    continue
+                try:
+                    cpu_us, resident_bytes, peak_resident_bytes = process_resource_sample(peer.pid)
+                except (OSError, KeyError, ValueError):
+                    continue
+                observed_peak_resident[role] = max(
+                    observed_peak_resident[role], resident_bytes, peak_resident_bytes
+                )
+                samples[role].append({
+                    "test_runner_timestamp_us": elapsed_us,
+                    "process_cpu_us": cpu_us,
+                    "resident_bytes": resident_bytes,
+                    "peak_resident_bytes": observed_peak_resident[role],
+                })
+            next_sample += interval
+        if time.monotonic() >= deadline:
+            active = next(role for role, peer in processes.items() if peer.poll() is None)
+            raise subprocess.TimeoutExpired(processes[active].args, timeout)
+        time.sleep(0.05)
+    return samples
+
+
+def verify_resource_samples(samples: dict[str, list[dict[str, int]]]) -> None:
+    for role in ROLES:
+        rows = samples.get(role, [])
+        require(bool(rows), f"{role} has no process resource samples")
+        require(all(left["test_runner_timestamp_us"] < right["test_runner_timestamp_us"]
+                    and left["process_cpu_us"] <= right["process_cpu_us"]
+                    and left["peak_resident_bytes"] <= right["peak_resident_bytes"]
+                    for left, right in zip(rows, rows[1:])),
+                f"{role} process resource samples are not monotonic")
+        require(all(row["resident_bytes"] > 0
+                    and row["peak_resident_bytes"] >= row["resident_bytes"]
+                    and row["process_cpu_us"] >= 0 for row in rows),
+                f"{role} process resource sample is invalid")
 
 
 def verify_timing(row: dict) -> None:
@@ -304,10 +418,16 @@ def run_case(
         if failure == "hangup":
             await_marker(listener / "microphone.receiving", peers["listener"], time.monotonic() + 6)
             stop_process(peers["initiator"])
-        deadline = time.monotonic() + (85 if capture is not None else 20)
+        resources = monitor_processes(peers, 85 if capture is not None else 20)
+        (output / "resource-samples.json").write_text(json.dumps({
+            "clock_domain": "test_runner_monotonic_us_since_launch",
+            "processes": resources,
+        }, indent=2) + "\n", encoding="utf-8")
+        if failure is None:
+            verify_resource_samples(resources)
         for role, peer in peers.items():
-            status = peer.wait(timeout=max(0.1, deadline - time.monotonic()))
-            require((status == 0) == (failure is None), f"{role} unexpected exit {status}")
+            require((peer.returncode == 0) == (failure is None),
+                    f"{role} unexpected exit {peer.returncode}")
         if failure == "auth":
             require("authentication rejected" in read_stderr(output, "listener"), "wrong auth error")
         if failure == "timeout":
@@ -353,6 +473,8 @@ def run_case(
                             f"{track} presentation clock is not increasing")
                     summary = row.get("presentation_summary", {})
                     require(summary.get("presented_frames") == len(events)
+                            and summary.get("decoded_frames_without_paint_event")
+                                == max(0, row["decoded_frames"] - len(events))
                             and summary.get("clock_domain") == "playback_helper_monotonic_us_since_start"
                             and summary.get("inter_event_interval_us", {}).get("samples")
                                 == max(0, len(events) - 1),

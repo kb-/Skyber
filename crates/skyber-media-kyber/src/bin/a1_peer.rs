@@ -229,6 +229,7 @@ struct AudioDrainEvent {
 struct PresentationSummary {
     clock_domain: &'static str,
     presented_frames: usize,
+    decoded_frames_without_paint_event: usize,
     frames_per_second: Option<f64>,
     inter_event_interval_us: Percentiles,
 }
@@ -455,7 +456,10 @@ fn parse_audio_drain_event(line: &str) -> Result<Option<AudioDrainEvent>> {
     }))
 }
 
-fn presentation_summary(events: &[PresentationEvent]) -> PresentationSummary {
+fn presentation_summary(
+    events: &[PresentationEvent],
+    decoded_frames: usize,
+) -> PresentationSummary {
     let times: Vec<_> = events
         .iter()
         .map(|event| event.helper_timestamp_us)
@@ -472,6 +476,7 @@ fn presentation_summary(events: &[PresentationEvent]) -> PresentationSummary {
     PresentationSummary {
         clock_domain: "playback_helper_monotonic_us_since_start",
         presented_frames: events.len(),
+        decoded_frames_without_paint_event: decoded_frames.saturating_sub(events.len()),
         frames_per_second,
         inter_event_interval_us: percentiles(intervals),
     }
@@ -1023,7 +1028,10 @@ async fn subscribe(
     observed.playback_bytes = delivered;
     observed.presentation_events = presentation_events;
     observed.audio_drain_events = audio_drain_events;
-    observed.presentation_summary = presentation_summary(&observed.presentation_events);
+    observed.presentation_summary = presentation_summary(
+        &observed.presentation_events,
+        observed.decoded_frames as usize,
+    );
     let playback: std::collections::HashMap<_, _> = playback_timings
         .into_iter()
         .map(|timing| (timing.packet_id_us, timing))
@@ -1264,8 +1272,9 @@ mod timing_tests {
             helper_timestamp_us,
             helper_clock_domain: "playback_helper_monotonic_us_since_start",
         });
-        let summary = presentation_summary(&events);
+        let summary = presentation_summary(&events, 4);
         assert_eq!(summary.presented_frames, 3);
+        assert_eq!(summary.decoded_frames_without_paint_event, 1);
         assert!((summary.frames_per_second.unwrap_or_default() - 15.0).abs() < 0.01);
         assert_eq!(summary.inter_event_interval_us.samples, 2);
         assert_eq!(summary.inter_event_interval_us.p50_us, Some(66_666));

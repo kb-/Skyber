@@ -30,11 +30,14 @@ The current boundaries are:
 | `playback_queue_depth`, `playback_enqueue_us` | Queue state and enqueue completion for decoded bytes accepted by the presentation task. |
 | `playback_submit_start_us`, `playback_submit_end_us` | Rust's write of decoded bytes to the platform helper pipe. This is not display scanout or speaker completion. |
 | `presentation_events` | For each Windows `WM_PAINT` or GTK `after-paint` event, the video helper reports the decoded packet ID and a helper-local monotonic timestamp. This is a window/compositor paint boundary, not physical display scanout. |
+| `presentation_summary.decoded_frames_without_paint_event` | Decoded frame count minus correlated paint-event count. This is a presentation shortfall indicator, not a scanout or network-loss count. |
 | `audio_drain_events` | One helper-local event after all decoded PCM sample frames have completed the Windows `waveOut` buffer queue or the Ubuntu GStreamer sink has posted EOS after drain. The count must equal the decoded sample-frame total. This is not acoustic output or per-packet speaker latency. |
 
 Video results also summarize event count, helper-local presentation rate,
 and p50/p95 inter-event intervals. These describe paint cadence on that
-helper only; they are not cross-host latency values.
+helper only; they are not cross-host latency values. The decoded-frame
+shortfall also exposes when a frame was superseded or otherwise had no
+paint callback before the helper finished.
 
 Each capture helper prefixes every fixed-size sample with an unsigned
 little-endian 64-bit helper-relative monotonic timestamp. The peer records
@@ -94,18 +97,19 @@ The 12-second synthetic playback case passed on Windows and Ubuntu
 26.04.1. Every reported paint event referenced a decoded packet ID, and
 each helper-local clock increased.
 
-| Platform | Track | Decoded frames | Paint events | Paint rate | Inter-event p50/p95 |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Windows GDI | Camera | 180 | 180 | 15.04 fps | 68,027 / 77,559 µs |
-| Windows GDI | Screen | 105 | 105 | 15.05 fps | 68,299 / 77,653 µs |
-| Ubuntu GTK | Camera | 180 | 163 | 15.10 fps | 67,107 / 71,275 µs |
-| Ubuntu GTK | Screen | 105 | 86 | 15.20 fps | 67,179 / 69,328 µs |
+| Platform | Track | Decoded frames | Paint events | No paint event | Paint rate | Inter-event p50/p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Windows GDI | Camera | 180 | 180 | 0 | 15.12 fps | 62,852 / 79,082 µs |
+| Windows GDI | Screen | 105 | 105 | 0 | 15.19 fps | 63,021 / 78,640 µs |
+| Ubuntu GTK | Camera | 180 | 162 | 18 | 15.17 fps | 66,909 / 72,419 µs |
+| Ubuntu GTK | Screen | 105 | 89 | 16 | 15.25 fps | 67,032 / 82,810 µs |
 
 The GTK viewer uses a latest-frame slot, so superseded frames can be
-decoded without being painted. These events end at the native
-window/compositor paint boundary, not display scanout. Structured Windows
-and Ubuntu results are under `target/a2-2/presentation-windows-timeoutfix/`
-and `target/a2-2/ubuntu-presentation-timeoutfix.stdout`.
+decoded without being painted. The no-paint counts report that shortfall;
+they do not identify every internal cause. These events end at the native
+window/compositor paint boundary, not display scanout. The latest checked
+results are under `target/a2-2/presentation-shortfall-windows/` and on the
+Ubuntu guest at `target/a2-2/presentation-shortfall-ubuntu/`.
 
 ### Audio output drain check
 
@@ -119,6 +123,27 @@ measure sound pressure at the speaker or give per-packet output times.
 Results are retained under
 `target/a2-2/audio-drain-windows/20261122T002128.606686Z/` and on the
 Ubuntu guest at `target/a2-2/audio-drain/20261122T002406.972306Z/`.
+
+### Peer CPU and memory sampling
+
+The test runner sampled peer-process CPU time and resident memory every
+500 ms during a 12-second synthetic playback case. Windows produced 25
+samples per peer; Ubuntu 26.04.1 produced 26. The observed sampled
+resident high-water values were:
+
+| Platform | Listener | Initiator |
+| --- | ---: | ---: |
+| Windows | 14.68 MiB | 14.06 MiB |
+| Ubuntu 26.04.1 | 14.62 MiB | 13.44 MiB |
+
+CPU time is included in each raw sample. Windows process accounting moved
+in 15.625 ms steps in this short run, so these samples are not suitable for
+fine CPU comparisons. The sampler measures the peer process only, not its
+separate capture or playback helper children. Raw time series are retained
+in the Windows playback result at
+`target/a2-2/presentation-shortfall-windows/20261122T003808.513421Z/playback/`
+and the Ubuntu guest's
+`target/a2-2/presentation-shortfall-ubuntu/20261122T003833.911910Z/playback/`.
 
 One full Windows playback run exceeded the peer's original four-second
 post-media shutdown margin. The identical-duration direct run and one
@@ -148,7 +173,8 @@ report acoustic output or per-packet speaker timing. Video presentation
 events report a correlated window/compositor paint, not a per-packet
 display device timestamp.
 
-The remaining A2-2 work is to collect CPU, memory, frame-rate and
-application-drop measurements. Glass-to-glass video and audio delay
+The remaining A2-2 work is to attribute no-paint shortfalls to specific
+capture, encode, decode, or presentation queue events and sample resource
+use for the separate media helpers. Glass-to-glass video and audio delay
 require an external reference such as a high-speed camera and LED/display.
 These are separate from the per-peer monotonic measurements above.
