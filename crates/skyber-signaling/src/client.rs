@@ -4,13 +4,16 @@
 //! Production code must use `wss://` with a trusted CA or an explicitly
 //! configured certificate pin before constructing this client.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use thiserror::Error;
 use tokio::time::timeout;
-use tokio_tungstenite::{tungstenite::Error as WebSocketError, tungstenite::Message};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, connect_async_tls_with_config, tungstenite::Error as WebSocketError,
+    tungstenite::Message,
+};
 use zeroize::Zeroize;
 
 use crate::{
@@ -26,6 +29,54 @@ const MAX_UFRAG_LENGTH: usize = 32;
 const MIN_ICE_PASSWORD_LENGTH: usize = 22;
 const MAX_ICE_PASSWORD_LENGTH: usize = 256;
 const MAX_RELAY_DATAGRAM: usize = 1200;
+
+pub type TlsSignalWebSocket =
+    tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Creates a signaling client over WSS using an explicit TLS trust policy.
+/// The supplied rustls configuration should use the platform trust store or a
+/// service pin; this connector never disables certificate validation.
+pub struct TlsSignalWebSocketConnector {
+    endpoint: String,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+}
+
+impl TlsSignalWebSocketConnector {
+    pub fn new(
+        endpoint: impl Into<String>,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> Result<Self, SignalClientError> {
+        let endpoint = endpoint.into();
+        crate::validate_invitation_endpoint(&endpoint)
+            .map_err(|_| SignalClientError::InvalidEndpoint)?;
+        Ok(Self {
+            endpoint,
+            tls_config: Some(tls_config),
+        })
+    }
+
+    /// Use the platform's native CA store. This requires native-root support,
+    /// enabled by the signaling crate's tokio-tungstenite feature set.
+    pub fn with_platform_roots(endpoint: impl Into<String>) -> Result<Self, SignalClientError> {
+        let endpoint = endpoint.into();
+        crate::validate_invitation_endpoint(&endpoint)
+            .map_err(|_| SignalClientError::InvalidEndpoint)?;
+        Ok(Self {
+            endpoint,
+            tls_config: None,
+        })
+    }
+
+    pub async fn connect(&self) -> Result<SignalClient<TlsSignalWebSocket>, SignalClientError> {
+        let connector = self
+            .tls_config
+            .as_ref()
+            .map(|config| Connector::Rustls(Arc::clone(config)));
+        let (websocket, _) =
+            connect_async_tls_with_config(self.endpoint.as_str(), None, true, connector).await?;
+        Ok(SignalClient::from_authenticated_websocket(websocket))
+    }
+}
 
 /// Typed signaling client over an already authenticated WebSocket connection.
 pub struct SignalClient<S> {
@@ -551,6 +602,10 @@ pub enum SignalClientError {
     RandomUnavailable,
     #[error("signaling service closed the WebSocket")]
     Closed,
+    #[error(
+        "signaling endpoint must be a valid wss:// URL without credentials, query, or fragment"
+    )]
+    InvalidEndpoint,
     #[error("signaling service returned an unexpected WebSocket frame")]
     UnexpectedFrame,
     #[error("signaling service returned an unexpected response")]
@@ -581,7 +636,7 @@ mod tests {
     use tokio_tungstenite::client_async;
 
     use super::{RelayClient, SignalClient, SignalEvent};
-    use crate::{PeerIdentity, server};
+    use crate::{PeerIdentity, TlsSignalWebSocketConnector, server};
 
     async fn websocket(
         address: SocketAddr,
@@ -606,16 +661,17 @@ mod tests {
     async fn client(
         address: SocketAddr,
         certificate: rustls::pki_types::CertificateDer<'static>,
-    ) -> anyhow::Result<
-        SignalClient<
-            tokio_tungstenite::WebSocketStream<
-                tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-            >,
-        >,
-    > {
-        Ok(SignalClient::from_authenticated_websocket(
-            websocket(address, certificate, "signal").await?,
-        ))
+    ) -> anyhow::Result<SignalClient<super::TlsSignalWebSocket>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate)?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsSignalWebSocketConnector::new(
+            format!("wss://localhost:{}/signal", address.port()),
+            Arc::new(config),
+        )?;
+        Ok(connector.connect().await?)
     }
 
     #[tokio::test]
@@ -630,6 +686,20 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let server_task = tokio::spawn(server::serve(listener, acceptor));
+
+        let wrong_ca = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let mut wrong_roots = rustls::RootCertStore::empty();
+        wrong_roots.add(wrong_ca.cert.der().clone())?;
+        let wrong_tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(wrong_roots)
+                .with_no_client_auth(),
+        );
+        let untrusted_connector = TlsSignalWebSocketConnector::new(
+            format!("wss://localhost:{}/signal", address.port()),
+            wrong_tls_config,
+        )?;
+        assert!(untrusted_connector.connect().await.is_err());
 
         let inviter_key = SigningKey::from_bytes(&[71; 32]);
         let invitee_key = SigningKey::from_bytes(&[72; 32]);
@@ -726,5 +796,29 @@ mod tests {
         invitee.close().await?;
         server_task.abort();
         Ok(())
+    }
+
+    #[test]
+    fn tls_signaling_connector_rejects_cleartext_and_secret_bearing_urls() {
+        let config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        for endpoint in [
+            "ws://calls.example.test/signal",
+            "wss://user@calls.example.test/signal",
+            "wss://calls.example.test/signal?token=secret",
+            "wss://calls.example.test/signal#fragment",
+        ] {
+            assert!(matches!(
+                TlsSignalWebSocketConnector::new(endpoint, Arc::clone(&config)),
+                Err(super::SignalClientError::InvalidEndpoint),
+            ));
+        }
+        assert!(
+            TlsSignalWebSocketConnector::with_platform_roots("wss://calls.example.test/signal")
+                .is_ok()
+        );
     }
 }

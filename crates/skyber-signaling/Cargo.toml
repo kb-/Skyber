@@ -19,7 +19,7 @@ subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
-tokio-tungstenite.workspace = true
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
 zeroize.workspace = true
 
 [dev-dependencies]

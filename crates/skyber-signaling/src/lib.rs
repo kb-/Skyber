@@ -589,7 +589,7 @@ pub mod server;
 
 pub use client::{
     AcceptedRoom, PeerCredentials, RelayClient, SecretString, SignalClient, SignalClientError,
-    SignalEvent,
+    SignalEvent, TlsSignalWebSocket, TlsSignalWebSocketConnector,
 };
 
 /// Bytes an inviter signs before requesting an invitation.
