@@ -97,3 +97,14 @@ and A2-1c work.
 [Media Foundation device discovery](https://learn.microsoft.com/en-us/windows/win32/medfound/enumerating-video-capture-devices)
 and [source reader](https://learn.microsoft.com/en-us/windows/win32/medfound/processing-media-data-with-the-source-reader).
 [Windows Graphics Capture](https://learn.microsoft.com/en-us/windows/uwp/audio-video-camera/screen-capture).
+
+## Windows camera retest (2026-11-22)
+
+A hidden-process LAN run reported `HRESULT 0x80070005` while opening camera
+index 0. The documented console probes were then rerun outside the sandbox.
+`--list camera` returned `HD Webcam`, and `--capture-one camera 0` captured
+a 1,382,400-byte sample in memory. The 60-second Windows A2 camera and
+microphone loopback passed: 593 camera frames and 2,988 microphone packets
+were sent, received, and decoded, with zero transport packet loss. The access
+denial did not reproduce in the documented console workflow. This run did not
+indicate a need to change camera Media Foundation behavior.
