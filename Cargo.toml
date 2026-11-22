@@ -3,6 +3,7 @@ members = [
     "crates/skyber-core",
     "crates/skyber-desktop-bridge",
     "crates/skyber-media-kyber",
+    "crates/skyber-signaling",
 ]
 resolver = "3"
 
@@ -15,13 +16,23 @@ license = "AGPL-3.0-or-later"
 anyhow = "1.0"
 bytes = "1"
 kymux = { git = "https://gitlab.com/kyber/core/kymux.git", rev = "af10dbb3ea016135c0ec8e01143179ad4bda005b", features = ["backend-quinn"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "std", "zeroize"] }
+futures-util = "=0.3.34"
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "=2.2.0"
+webrtc-ice = "=0.17.3"
+webrtc-util = "=0.17.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "=0.10.9"
 skyber-core = { path = "crates/skyber-core" }
 subtle = "2.6"
 thiserror = "2"
 getrandom = "0.4"
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = "=0.30.0"
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 zeroize = "1.9"
 
 [workspace.lints.rust]

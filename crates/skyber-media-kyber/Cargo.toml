@@ -13,6 +13,7 @@ anyhow.workspace = true
 bytes.workspace = true
 getrandom.workspace = true
 kymux.workspace = true
+quinn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 skyber-core.workspace = true
@@ -20,6 +21,14 @@ subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+webrtc-ice.workspace = true
+webrtc-util.workspace = true
+
+[dev-dependencies]
+rcgen = "=0.14.10"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-tungstenite = "=0.30.0"
+futures-util = "=0.3.34"
 
 [[bin]]
 name = "skyber-a1-peer"
