@@ -256,6 +256,17 @@ where
         .await
     }
 
+    /// Tell the room peer that this ICE agent has finished gathering candidates.
+    pub async fn finish_candidate_gathering(
+        &mut self,
+        room: RoomId,
+    ) -> Result<(), SignalClientError> {
+        self.send(ClientMessage::CandidatesComplete {
+            room: *room.as_bytes(),
+        })
+        .await
+    }
+
     /// Forward ICE credentials to the authenticated room peer.
     pub async fn send_ice_credentials(
         &mut self,
@@ -348,6 +359,13 @@ where
                     from_peer: PeerIdentity::from_bytes(from_peer)
                         .map_err(|_| SignalClientError::InvalidIdentity)?,
                     candidate,
+                })
+            }
+            ServerMessage::CandidatesComplete { room, from_peer } => {
+                Ok(SignalEvent::CandidatesComplete {
+                    room: RoomId::from_bytes(room),
+                    from_peer: PeerIdentity::from_bytes(from_peer)
+                        .map_err(|_| SignalClientError::InvalidIdentity)?,
                 })
             }
             ServerMessage::PeerLeft { room } => Ok(SignalEvent::PeerLeft(RoomId::from_bytes(room))),
@@ -449,6 +467,10 @@ pub enum SignalEvent {
         from_peer: PeerIdentity,
         candidate: String,
     },
+    CandidatesComplete {
+        room: RoomId,
+        from_peer: PeerIdentity,
+    },
     PeerLeft(RoomId),
 }
 
@@ -485,6 +507,11 @@ impl std::fmt::Debug for SignalEvent {
                 .field("room", room)
                 .field("from_peer", from_peer)
                 .field("candidate", candidate)
+                .finish(),
+            Self::CandidatesComplete { room, from_peer } => formatter
+                .debug_struct("CandidatesComplete")
+                .field("room", room)
+                .field("from_peer", from_peer)
                 .finish(),
             Self::PeerLeft(room) => formatter.debug_tuple("PeerLeft").field(room).finish(),
         }
@@ -642,6 +669,7 @@ mod tests {
                 "local-ice-password-with-22-chars".to_owned(),
             )
             .await?;
+        invitee.finish_candidate_gathering(invitation.room).await?;
         let SignalEvent::IceCredentials {
             room,
             from_peer,
@@ -656,6 +684,11 @@ mod tests {
         assert_eq!(ufrag.expose(), "local-ufrag");
         assert_eq!(password.expose(), "local-ice-password-with-22-chars");
         assert_eq!(format!("{ufrag:?}"), "[redacted]");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), inviter.receive()).await??,
+            SignalEvent::CandidatesComplete { room, from_peer }
+                if room == invitation.room && from_peer == invitee_identity
+        ));
 
         let mut inviter_relay = RelayClient::join(
             websocket(address, certificate.clone(), "relay").await?,

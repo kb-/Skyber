@@ -78,6 +78,9 @@ pub(crate) enum ClientMessage {
         room: [u8; 16],
         candidate: String,
     },
+    CandidatesComplete {
+        room: [u8; 16],
+    },
     Hangup {
         room: [u8; 16],
     },
@@ -117,6 +120,10 @@ pub(crate) enum ServerMessage {
         room: [u8; 16],
         from_peer: [u8; 32],
         candidate: String,
+    },
+    CandidatesComplete {
+        room: [u8; 16],
+        from_peer: [u8; 32],
     },
     PeerLeft {
         room: [u8; 16],
@@ -819,6 +826,22 @@ async fn handle_message(
                         .ok_or(InvitationError::NotFound)?
                         .as_bytes(),
                     candidate,
+                },
+            )
+            .await
+        }
+        ClientMessage::CandidatesComplete { room } => {
+            let room = RoomId::from_bytes(room);
+            forward_to_peer(
+                room,
+                connection,
+                shared,
+                ServerMessage::CandidatesComplete {
+                    room: *room.as_bytes(),
+                    from_peer: *connection
+                        .identity
+                        .ok_or(InvitationError::NotFound)?
+                        .as_bytes(),
                 },
             )
             .await
