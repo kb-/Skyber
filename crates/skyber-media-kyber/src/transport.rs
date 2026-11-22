@@ -12,6 +12,8 @@ use skyber_core::Track;
 const CONTROL_ENDPOINT: u16 = 0;
 const MAP_VERSION: u8 = 1;
 const MAP_SIZE: usize = 8;
+const PROTOCOL_MAP_VERSION: u8 = 1;
+const PROTOCOL_MAP_SIZE: usize = 4;
 const COMPLETE: &[u8] = b"\x01done";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -131,6 +133,54 @@ async fn connect_to(
 pub type Outbound = (Track, types::VideoServerEndpoint);
 pub type Inbound = (Track, types::VideoClientEndpoint);
 
+/// Audio transport selected for a microphone track.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioMode {
+    Auto,
+    Reliable,
+    Unreliable,
+    UnreliableFec,
+}
+
+/// Video transport selected independently for webcam and screen tracks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoMode {
+    Auto,
+    Reliable,
+    GopStream,
+    Unreliable,
+    UnreliableFec,
+}
+
+/// Local per-track preferences. `Auto` currently resolves to Reliable while
+/// Internet comparisons are pending. The negotiated effective values are
+/// reported by [`TrackEndpoints::effective_protocols`].
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub struct TrackProtocols {
+    pub microphone: AudioMode,
+    pub camera: VideoMode,
+    pub screen: VideoMode,
+}
+
+impl Default for TrackProtocols {
+    fn default() -> Self {
+        Self {
+            microphone: AudioMode::Auto,
+            camera: VideoMode::Auto,
+            screen: VideoMode::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EffectiveTrackProtocols {
+    pub microphone: Option<AudioMode>,
+    pub camera: Option<VideoMode>,
+    pub screen: Option<VideoMode>,
+}
+
 /// Per-peer endpoint map exchanged over the authenticated A1 control endpoint.
 #[derive(Debug, Default, Eq, PartialEq)]
 struct TrackMap([Option<u16>; 3]);
@@ -179,9 +229,14 @@ pub struct TrackEndpoints {
     pub outbound: Vec<Outbound>,
     pub inbound: Vec<Inbound>,
     control: types::DataProtocol,
+    effective_protocols: EffectiveTrackProtocols,
 }
 
 impl TrackEndpoints {
+    pub const fn effective_protocols(&self) -> EffectiveTrackProtocols {
+        self.effective_protocols
+    }
+
     pub async fn finish(&mut self, role: Role) -> Result<()> {
         let (tx, rx) = &mut self.control;
         let complete = types::DataPacket {
@@ -206,6 +261,17 @@ pub async fn register_tracks(
     send: &[Track],
     receive: &[Track],
 ) -> Result<TrackEndpoints> {
+    register_tracks_with_protocols(connection, role, send, receive, TrackProtocols::default()).await
+}
+
+/// Negotiate outbound track protocols before creating any media endpoint.
+pub async fn register_tracks_with_protocols(
+    connection: &kyproto::Connection,
+    role: Role,
+    send: &[Track],
+    receive: &[Track],
+    protocols: TrackProtocols,
+) -> Result<TrackEndpoints> {
     let endpoint = if role == Role::Listener {
         let (id, endpoint) = connection.register_data_endpoint().await?;
         ensure!(id == CONTROL_ENDPOINT, "Kyber bootstrap endpoint changed");
@@ -215,18 +281,31 @@ pub async fn register_tracks(
     };
     let (mut tx, mut rx) = endpoint.ready().await?;
 
+    let local_protocols = encode_protocols(send, protocols);
+    tx.send(types::DataPacket {
+        payload: Bytes::copy_from_slice(&local_protocols),
+    })
+    .await?;
+    let remote_protocol_packet = rx.recv().await?.context("missing peer protocol map")?;
+    let remote_protocols = decode_protocols(&remote_protocol_packet.payload, receive)?;
+
     let mut outbound = Vec::new();
     let mut map = TrackMap::default();
     for &track in send {
         let (id, endpoint) = match track {
             Track::Microphone => {
                 connection
-                    .register_audio_endpoint(kyproto::AudioProtocol::Reliable)
+                    .register_audio_endpoint(audio_protocol(protocols.microphone))
                     .await?
             }
-            Track::Camera | Track::Screen => {
+            Track::Camera => {
                 connection
-                    .register_video_endpoint(kyproto::VideoProtocol::Reliable)
+                    .register_video_endpoint(video_protocol(protocols.camera))
+                    .await?
+            }
+            Track::Screen => {
+                connection
+                    .register_video_endpoint(video_protocol(protocols.screen))
                     .await?
             }
         };
@@ -253,12 +332,30 @@ pub async fn register_tracks(
         );
         if let Some(id) = endpoint {
             let endpoint = match track {
-                Track::Microphone => {
-                    connection.connect_audio_endpoint(id, kyproto::AudioProtocol::Reliable)?
-                }
-                Track::Camera | Track::Screen => {
-                    connection.connect_video_endpoint(id, kyproto::VideoProtocol::Reliable)?
-                }
+                Track::Microphone => connection.connect_audio_endpoint(
+                    id,
+                    audio_protocol(
+                        remote_protocols
+                            .microphone
+                            .context("missing remote microphone mode")?,
+                    ),
+                )?,
+                Track::Camera => connection.connect_video_endpoint(
+                    id,
+                    video_protocol(
+                        remote_protocols
+                            .camera
+                            .context("missing remote camera mode")?,
+                    ),
+                )?,
+                Track::Screen => connection.connect_video_endpoint(
+                    id,
+                    video_protocol(
+                        remote_protocols
+                            .screen
+                            .context("missing remote screen mode")?,
+                    ),
+                )?,
             };
             inbound.push((track, endpoint));
         }
@@ -267,12 +364,162 @@ pub async fn register_tracks(
         outbound,
         inbound,
         control: (tx, rx),
+        effective_protocols: EffectiveTrackProtocols {
+            microphone: send
+                .contains(&Track::Microphone)
+                .then_some(resolve_audio(protocols.microphone)),
+            camera: send
+                .contains(&Track::Camera)
+                .then_some(resolve_video(protocols.camera)),
+            screen: send
+                .contains(&Track::Screen)
+                .then_some(resolve_video(protocols.screen)),
+        },
     })
+}
+
+fn encode_protocols(send: &[Track], protocols: TrackProtocols) -> [u8; PROTOCOL_MAP_SIZE] {
+    let mut encoded = [0; PROTOCOL_MAP_SIZE];
+    encoded[0] = PROTOCOL_MAP_VERSION;
+    for track in send {
+        let index = *track as usize;
+        encoded[index + 1] = match track {
+            Track::Microphone => audio_mode_byte(resolve_audio(protocols.microphone)),
+            Track::Camera => video_mode_byte(resolve_video(protocols.camera)),
+            Track::Screen => video_mode_byte(resolve_video(protocols.screen)),
+        };
+    }
+    encoded
+}
+
+fn decode_protocols(data: &[u8], receive: &[Track]) -> Result<EffectiveTrackProtocols> {
+    ensure!(
+        data.len() == PROTOCOL_MAP_SIZE,
+        "invalid protocol map length"
+    );
+    ensure!(
+        data[0] == PROTOCOL_MAP_VERSION,
+        "unsupported protocol map version"
+    );
+    for track in receive {
+        ensure!(
+            data[*track as usize + 1] != 0,
+            "peer did not configure {} protocol",
+            track.label()
+        );
+    }
+    ensure!(data[1] <= 3, "unsupported audio protocol");
+    ensure!(data[2] <= 4, "unsupported camera protocol");
+    ensure!(data[3] <= 4, "unsupported screen protocol");
+    Ok(EffectiveTrackProtocols {
+        microphone: mode_audio(data[1]),
+        camera: mode_video(data[2]),
+        screen: mode_video(data[3]),
+    })
+}
+
+const fn resolve_audio(mode: AudioMode) -> AudioMode {
+    match mode {
+        AudioMode::Auto => AudioMode::Reliable,
+        other => other,
+    }
+}
+
+const fn resolve_video(mode: VideoMode) -> VideoMode {
+    match mode {
+        VideoMode::Auto => VideoMode::Reliable,
+        other => other,
+    }
+}
+
+const fn audio_mode_byte(mode: AudioMode) -> u8 {
+    match mode {
+        AudioMode::Reliable => 1,
+        AudioMode::Unreliable => 2,
+        AudioMode::UnreliableFec => 3,
+        AudioMode::Auto => 0,
+    }
+}
+
+const fn video_mode_byte(mode: VideoMode) -> u8 {
+    match mode {
+        VideoMode::Reliable => 1,
+        VideoMode::GopStream => 2,
+        VideoMode::Unreliable => 3,
+        VideoMode::UnreliableFec => 4,
+        VideoMode::Auto => 0,
+    }
+}
+
+fn mode_audio(mode: u8) -> Option<AudioMode> {
+    match mode {
+        1 => Some(AudioMode::Reliable),
+        2 => Some(AudioMode::Unreliable),
+        3 => Some(AudioMode::UnreliableFec),
+        _ => None,
+    }
+}
+
+fn mode_video(mode: u8) -> Option<VideoMode> {
+    match mode {
+        1 => Some(VideoMode::Reliable),
+        2 => Some(VideoMode::GopStream),
+        3 => Some(VideoMode::Unreliable),
+        4 => Some(VideoMode::UnreliableFec),
+        _ => None,
+    }
+}
+
+const fn audio_protocol(mode: AudioMode) -> kyproto::AudioProtocol {
+    match resolve_audio(mode) {
+        AudioMode::Reliable => kyproto::AudioProtocol::Reliable,
+        AudioMode::Unreliable => kyproto::AudioProtocol::Unreliable,
+        AudioMode::UnreliableFec => kyproto::AudioProtocol::UnreliableFec,
+        AudioMode::Auto => kyproto::AudioProtocol::Reliable,
+    }
+}
+
+const fn video_protocol(mode: VideoMode) -> kyproto::VideoProtocol {
+    match resolve_video(mode) {
+        VideoMode::Reliable => kyproto::VideoProtocol::Reliable,
+        VideoMode::GopStream => kyproto::VideoProtocol::GopStream,
+        VideoMode::Unreliable => kyproto::VideoProtocol::Unreliable,
+        VideoMode::UnreliableFec => kyproto::VideoProtocol::UnreliableFec,
+        VideoMode::Auto => kyproto::VideoProtocol::Reliable,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_mode_resolves_to_reliable_and_manual_modes_round_trip() -> Result<()> {
+        let protocols = TrackProtocols {
+            microphone: AudioMode::UnreliableFec,
+            camera: VideoMode::GopStream,
+            screen: VideoMode::Reliable,
+        };
+        let encoded = encode_protocols(&Track::ALL, protocols);
+        let decoded = decode_protocols(&encoded, &Track::ALL)?;
+        assert_eq!(decoded.microphone, Some(AudioMode::UnreliableFec));
+        assert_eq!(decoded.camera, Some(VideoMode::GopStream));
+        assert_eq!(decoded.screen, Some(VideoMode::Reliable));
+
+        let automatic = encode_protocols(&[Track::Microphone], TrackProtocols::default());
+        let resolved = decode_protocols(&automatic, &[Track::Microphone])?;
+        assert_eq!(resolved.microphone, Some(AudioMode::Reliable));
+        assert_eq!(resolved.camera, None);
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_map_rejects_missing_modes_and_unknown_variants() {
+        assert!(decode_protocols(&[1, 0, 0, 0], &[Track::Microphone]).is_err());
+        assert!(decode_protocols(&[1, 1, 5, 0], &[Track::Camera]).is_err());
+        assert!(decode_protocols(&[2, 1, 1, 1], &Track::ALL).is_err());
+        assert!(decode_protocols(&[1, 1], &Track::ALL).is_err());
+    }
 
     #[test]
     fn lan_address_requires_specific_private_ipv4() {
