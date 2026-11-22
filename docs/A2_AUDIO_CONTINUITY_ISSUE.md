@@ -37,16 +37,60 @@ seconds. No microphone audio was saved in these checks. See
 ## Sandbox and cause assessment
 
 The direct ALSA failure reproduces independently of Skyber's GStreamer helper,
-Rust peer, and Kyber transport, which argues against those components being the
-sole cause. The run record does not establish that `arecord` ran outside every
-coding-agent process sandbox. A repeat from the Ubuntu guest's interactive
-desktop terminal is needed to settle that distinction.
+Rust peer, and Kyber transport. Retesting directly in the Ubuntu guest outside
+the Windows coding-agent sandbox reproduced the failure.
 
 The evidence does not identify whether the remaining cause is the C922, the
 Windows host's USB controller, VirtualBox USB passthrough, or the Ubuntu
 guest's device/kernel path. It also does not establish acoustic speaker output
 or prove that the original two-direction call's capture sources were the same
 as those in the later C922 tests. No audio-capture or codec fix is confirmed.
+
+## VirtualBox USB 2.0 retest (2026-11-22)
+
+After a guest restart, `lsusb -t` showed the C922 video and audio interfaces
+on the virtual EHCI controller at 480 Mbit/s. The Linux guest still listed the
+C922 under ALSA and PipeWire. The direct command below returned `Input/output
+error` shortly after starting.
+
+```bash
+arecord -D hw:Webcam,0 -t raw -f S16_LE -r 32000 -c 2 -d 120 /dev/null
+```
+
+The fast-draining Skyber capture harness, requested for 60 seconds, timed out
+after about 5 seconds with zero provider buffers. A 15-second onboard microphone
+control using the same helper in the same guest produced 742 blocks with a
+maximum block gap of 30.0 ms. The USB 2.0 setting did not resolve the C922
+failure in this retest.
+
+## Virtual audio input with the USB filter disabled (2026-11-22)
+
+With the VirtualBox USB filter disabled and the C922 selected as the Windows
+host's default input by the operator, the guest no longer enumerated the C922
+as a USB device. Ubuntu's default input was the virtual Intel ICH source
+`alsa_input.pci-0000_00_05.0.analog-stereo`. This configuration tests the VM's
+virtual audio route. The guest cannot independently identify the physical
+microphone selected on the host.
+
+The 60-second Skyber capture harness received 2,990 complete blocks and
+2,870,400 sample frames (99.67% coverage). The maximum provider and emitted
+block gaps were 31.2 ms and 39.9 ms, respectively. Signal checks then showed
+the guest was receiving silence:
+
+- Direct stereo ALSA capture from `hw:I82801AAICH,0` at 48 kHz completed
+  120 seconds and returned all 5,760,000 expected frames. Every sample was zero.
+- A 10-second run of the Skyber helper on the default source returned 493
+  complete blocks, all zero, with the PipeWire input at volume 1.00 and ALSA
+  capture enabled.
+- A 5-second capture from the alternate virtual microphone input
+  `plughw:I82801AAICH,1` also returned only zero samples.
+
+The timing check shows that the VM delivers buffers on the virtual audio
+route. It does not establish that microphone audio reaches the guest. Check
+the C922 input meter on the Windows host and whether Audio Input is enabled
+in VirtualBox before using this route for a call. The guest did not list a
+video source in PipeWire with this configuration. Only counts and peak levels
+were retained from the signal checks.
 
 ## Next diagnostic step
 
