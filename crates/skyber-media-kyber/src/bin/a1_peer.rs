@@ -216,6 +216,7 @@ struct SourceFrame {
     source_ready_us: u64,
     capture_helper_timestamp_us: u64,
     capture_queue_depth: usize,
+    capture_queue_wait_us: u64,
 }
 
 struct EncodedPacket {
@@ -281,6 +282,7 @@ struct TimingSample {
     source_ready_us: Option<u64>,
     capture_helper_timestamp_us: Option<u64>,
     capture_queue_depth: Option<usize>,
+    capture_queue_wait_us: Option<u64>,
     encode_start_us: Option<u64>,
     encode_end_us: Option<u64>,
     encode_queue_depth: Option<usize>,
@@ -308,6 +310,7 @@ struct TimingSummary {
     capture_pipe_packets_per_second: Option<f64>,
     received_packets_per_second: Option<f64>,
     source_to_encode_us: Percentiles,
+    capture_queue_wait_us: Percentiles,
     encode_us: Percentiles,
     encode_to_transport_us: Percentiles,
     transport_send_us: Percentiles,
@@ -362,6 +365,12 @@ fn timing_summary(samples: &[TimingSample]) -> TimingSummary {
             samples
                 .iter()
                 .filter_map(|sample| duration(sample.source_ready_us, sample.encode_start_us))
+                .collect(),
+        ),
+        capture_queue_wait_us: percentiles(
+            samples
+                .iter()
+                .filter_map(|sample| sample.capture_queue_wait_us)
                 .collect(),
         ),
         encode_us: percentiles(
@@ -629,6 +638,7 @@ fn encode_track(
             };
             if let Some(frame) = &captured {
                 timing.capture_queue_depth = Some(frame.capture_queue_depth);
+                timing.capture_queue_wait_us = Some(frame.capture_queue_wait_us);
             }
             let packet = media(pts, Bytes::copy_from_slice(payload), false, key)?;
             tx.blocking_send(EncodedPacket {
@@ -704,13 +714,19 @@ async fn capture_frames(
         if let Some(signal) = ready.take() {
             signal.send_replace(true);
         }
+        let queue_depth = channel.max_capacity().saturating_sub(channel.capacity());
         let queued = SourceFrame {
             bytes: frame,
             source_ready_us: elapsed_micros(origin)?,
             capture_helper_timestamp_us: u64::from_le_bytes(timestamp),
-            capture_queue_depth: channel.max_capacity().saturating_sub(channel.capacity()),
+            capture_queue_depth: queue_depth,
+            capture_queue_wait_us: 0,
         };
-        channel.send(queued).await?;
+        let queue_wait_start = Instant::now();
+        let permit = channel.reserve().await?;
+        let mut queued = queued;
+        queued.capture_queue_wait_us = queue_wait_start.elapsed().as_micros().try_into()?;
+        permit.send(queued);
     }
     ensure!(child.wait().await?.success(), "capture helper failed");
     Ok(())

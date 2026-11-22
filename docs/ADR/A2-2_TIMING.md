@@ -234,3 +234,112 @@ capture, encode, decode, or presentation queue events and sample resource
 use for the separate media helpers. Glass-to-glass video and audio delay
 require an external reference such as a high-speed camera and LED/display.
 These are separate from the per-peer monotonic measurements above.
+
+## Audio continuity capture-only investigation (2026-11-22)
+
+The opt-in `SKYBER_AUDIO_DIAGNOSTICS=1` helper summaries now count provider
+buffers and 48 kHz sample frames, report provider and output-write gaps,
+record negotiated GStreamer caps and buffer timing, and compare emitted PCM
+blocks with provider frames. The peer report also includes the time each
+captured frame waited for its bounded Rust queue. The new
+`scripts/test-a2-audio-continuity.py` reads and discards PCM records, reports
+gap percentiles, and offers a 15-minute `--acceptance` mode. Its seventeen
+synthetic unit checks cover partial and truncated pipe reads, percentile
+calculation, and provider-to-block reconciliation.
+
+Fast-drain capture-only results:
+
+| Platform and input | Duration | Sample-frame coverage | Maximum provider gap | Maximum output flush | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Windows 11, microphone index 0 | 900 s | 99.958% | 68.7 ms | 0.74 ms | Meets provisional capture-only targets |
+| Ubuntu 26.04.1, onboard analog microphone | 900 s | 99.951% | 30.9 ms | 7.8 ms | Meets provisional capture-only targets |
+| Ubuntu 26.04.1 VM, Logitech C922 microphone, first soak | 900 s | 75.15% | 4.13 s | 7.7 ms | Fails duration and continuity targets |
+| Ubuntu 26.04.1 VM, Logitech C922 microphone, confirmation soak | 900 s | 57.95% | 4.12 s | 4.6 ms | Fails duration and continuity targets |
+
+The capture-only 15-minute acceptance evaluator was replayed against saved
+reports: Windows and Ubuntu onboard microphone pass (99.958% and 99.952%
+provider coverage; 68.7 ms and 42.9 ms maximum emitted-block gaps). Both
+Ubuntu C922 soaks fail coverage and the 200 ms gap limit. These are rechecks
+of saved evidence; the hardware command itself was run before acceptance mode
+was added.
+
+The C922 helper reports 48 kHz stereo caps and provider sample-frame counts
+reconcile exactly with emitted blocks. Its summed GStreamer buffer duration
+was about 522 s in the first failed soak and 522 s in the confirmation soak,
+despite about 900 s of wall-clock provider activity. The measured stdout
+flush times do not explain the deficit. The same C922 input produced complete
+30 s capture-only runs with no gap above 29 ms, and the onboard microphone
+passed a 30 s check and the 15-minute acceptance run. This localizes the
+observed sustained deficit to the Ubuntu VM C922 capture path under the long
+run conditions. It does not establish whether USB passthrough, device power
+management, PipeWire scheduling, or another host condition causes the
+intermittent loss. No capture, codec, or Kyber behavior change has been made.
+
+The updated Linux GNU peer built against the staged codec library. Its seventeen
+Python continuity tests passed, the media crate's five Rust tests passed,
+Clippy and formatting passed, and the Windows synthetic two-peer suite passed
+all ten cases. The Linux synthetic A2 suite also passed all ten cases. A live
+Ubuntu microphone-and-camera loopback passed, with a maximum provider gap of
+178 ms in that short run and 1 microsecond p95 Rust capture-queue wait. A
+separate slow-reader control produced approximately 325 ms provider and
+stdout-flush stalls, confirming the diagnostic signature of pipe
+backpressure.
+
+A 15-minute Ubuntu live microphone-and-camera loopback using the onboard
+microphone also passed. It published and received 44,929 Opus packets,
+decoded 43,131,528 sample frames, and reconciled the 312-frame decoder
+priming skip. Provider output covered 99.84% of the requested duration, the
+largest provider gap was 69.4 ms, and Rust capture-queue wait p95 remained
+1 microsecond. This shows the local encode, bounded queue, reliable Kyber
+loopback, and decode path sustaining the onboard source.
+
+A second 15-minute Ubuntu C922 microphone-and-camera live loopback reproduced
+the capture-only deficit. The helper supplied 24,712,800 of 43,200,000
+expected sample frames (57.21%), with a 4.125 s maximum provider gap and
+2.9 ms maximum stdout flush. Its 25,742 emitted blocks matched the peer's
+published packets; the initiator received and decoded all 25,742, with
+24,712,008 decoded sample frames after the 312-frame Opus priming skip
+(57.20% of expected output). Emitted-block gap p50/p95/p99 were
+21.45/23.23/39.13 ms, with a 4.125 s maximum. Capture-queue wait p95 was
+1 microsecond. This places the measured deficit
+before peer queueing and Kyber loopback delivery for this run. The cause
+within the Ubuntu VM's C922 capture path remains unknown.
+
+To separate the source device from GStreamer and PipeWire, direct ALSA
+capture was also sent to `/dev/null` (no microphone audio was stored).
+`arecord -D hw:1,0 -t raw -f S16_LE -r 32000 -c 2 -d 120 /dev/null`
+failed with an ALSA read `Input/output error` after about 30 seconds. A
+subsequent 60-second run at 32 kHz failed the same way; a 60-second run at
+16 kHz also failed. A 10-second 32 kHz retry completed. The onboard control,
+`arecord -D hw:0,0 -t raw -f S16_LE -r 48000 -c 2 -d 60 /dev/null`, exited
+successfully. This directly demonstrates intermittent failure in the C922
+ALSA/USB path independently of the Skyber helper, Rust peer, Kyber, and
+PipeWire, while the onboard ALSA source remains stable in the same guest.
+The C922 enumerates at 480 Mbit/s on the guest's virtual xHCI controller,
+with separate UVC and USB-audio interfaces. Its audio capture interface
+lists only 16, 24, and 32 kHz modes; the Skyber helper negotiates 48 kHz
+through PipeWire. These facts do not identify whether VirtualBox USB
+passthrough, the host controller, the webcam, or another kernel-level issue
+causes the I/O errors. `dmesg` access was denied, and this account cannot read
+the kernel journal or use passwordless sudo. A native Ubuntu host or
+privileged USB/kernel diagnostics are needed before choosing an application
+change.
+
+The live loopback was run before the new `--acceptance` option was added.
+Evaluating its saved report with the new 15-minute acceptance checks reports
+the expected failures for provider, published, and decoded duration, and
+provider and emitted-block gaps. `scripts/test-a2-capture.py --acceptance`
+now enables helper diagnostics, checks 99.5% coverage at each stage, reports
+emitted-block gap percentiles, enforces 200 ms maximum provider and emitted
+gaps, and reconciles emitted blocks, provider frames, sent and received
+packets, decoded frames, and the measured 312-frame priming skip. Its failure
+path and passing synthetic fixtures are covered by the fast continuity unit
+suite.
+
+The cross-host synthetic Wi-Fi handshake did not complete in either role
+direction. Windows had no inbound UDP 34829 rule for the Ubuntu host.
+Creating the temporary scoped Private-profile rule was denied by the
+environment, and the Ubuntu account does not have passwordless sudo to
+inspect or change its firewall. Therefore the two-host LAN and six-track live
+acceptance remain unrun. Raw reports and private peer configurations remain
+under ignored `target/` directories.
