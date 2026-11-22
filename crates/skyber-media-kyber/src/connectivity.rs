@@ -197,9 +197,19 @@ pub async fn connect_and_probe(
     })
     .await
     .context("Gate C-0 shutdown timed out");
-    connection.close(0, "Gate C-0 probe complete");
+    if exchange_result.is_err() || shutdown_result.is_err() {
+        connection.close(1, "Gate C-0 probe failed");
+    }
+    let close_result = if exchange_result.is_ok() && shutdown_result.is_ok() {
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.closed())
+            .await
+            .context("Gate C-0 shutdown timed out")
+    } else {
+        Ok(Ok(()))
+    };
     exchange_result??;
     shutdown_result??;
+    close_result??;
     Ok(())
 }
 
@@ -270,11 +280,11 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
                 ack[0] == EXCHANGE_ACK,
                 "invalid Gate C-0 exchange acknowledgment"
             );
+            raw.close(0, "Gate C-0 probe complete");
             Ok::<(), anyhow::Error>(())
         })
         .await
         .context("Gate C-0 shutdown timed out");
-        raw.close(0, "Gate C-0 probe complete");
         exchange_result??;
         shutdown_result??;
         Ok::<(), anyhow::Error>(())
