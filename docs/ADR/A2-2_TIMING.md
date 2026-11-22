@@ -30,6 +30,7 @@ The current boundaries are:
 | `playback_queue_depth`, `playback_enqueue_us` | Queue state and enqueue completion for decoded bytes accepted by the presentation task. |
 | `playback_submit_start_us`, `playback_submit_end_us` | Rust's write of decoded bytes to the platform helper pipe. This is not display scanout or speaker completion. |
 | `presentation_events` | For each Windows `WM_PAINT` or GTK `after-paint` event, the video helper reports the decoded packet ID and a helper-local monotonic timestamp. This is a window/compositor paint boundary, not physical display scanout. |
+| `audio_drain_events` | One helper-local event after all decoded PCM sample frames have completed the Windows `waveOut` buffer queue or the Ubuntu GStreamer sink has posted EOS after drain. The count must equal the decoded sample-frame total. This is not acoustic output or per-packet speaker latency. |
 
 Video results also summarize event count, helper-local presentation rate,
 and p50/p95 inter-event intervals. These describe paint cadence on that
@@ -106,6 +107,19 @@ window/compositor paint boundary, not display scanout. Structured Windows
 and Ubuntu results are under `target/a2-2/presentation-windows-timeoutfix/`
 and `target/a2-2/ubuntu-presentation-timeoutfix.stdout`.
 
+### Audio output drain check
+
+The 12-second synthetic playback case passed on Windows and Ubuntu
+26.04.1. Each audio helper emitted exactly one drain event, and the event's
+sample-frame count matched the receiver's decoded count of 575,688 on both
+peers. Windows reported helper time 12,066,664 µs; Ubuntu reported
+12,326,834 µs. The two helper clocks are independent. These events mark
+completion at the platform output queue/sink drain boundary; they do not
+measure sound pressure at the speaker or give per-packet output times.
+Results are retained under
+`target/a2-2/audio-drain-windows/20261122T002128.606686Z/` and on the
+Ubuntu guest at `target/a2-2/audio-drain/20261122T002406.972306Z/`.
+
 One full Windows playback run exceeded the peer's original four-second
 post-media shutdown margin. The identical-duration direct run and one
 complete wrapper retry passed. The playback test peer now allows a
@@ -128,13 +142,13 @@ it is not a hardware sensor timestamp or an end-to-end LAN latency sample.
 
 These measurements describe application boundaries. They do not
 measure camera exposure, transport one-way latency, physical display
-scanout, acoustic output completion, or glass-to-glass delay. In
-particular, the audio playback submission boundary ends at the helper
-pipe. Video presentation events report a correlated window/compositor
-paint, not a per-packet display device timestamp.
+scanout, acoustic output, or glass-to-glass delay. The audio drain event
+marks completion at the platform output queue/sink boundary but does not
+report acoustic output or per-packet speaker timing. Video presentation
+events report a correlated window/compositor paint, not a per-packet
+display device timestamp.
 
-The remaining A2-2 work is to add native audio output completion events
-and collect CPU, memory, frame-rate and application-drop measurements.
-Glass-to-glass video and audio delay require an external reference such as
-a high-speed camera and LED/display. These are separate from the per-peer
-monotonic measurements above.
+The remaining A2-2 work is to collect CPU, memory, frame-rate and
+application-drop measurements. Glass-to-glass video and audio delay
+require an external reference such as a high-speed camera and LED/display.
+These are separate from the per-peer monotonic measurements above.

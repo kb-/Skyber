@@ -19,6 +19,7 @@ constexpr int height = 180;
 constexpr unsigned i420_size = width * height * 3 / 2;
 
 int play_audio(HANDLE input, UINT device) {
+    const auto helper_start = std::chrono::steady_clock::now();
     WAVEFORMATEX format{WAVE_FORMAT_PCM, 2, 48000, 192000, 4, 16, 0};
     HWAVEOUT output = nullptr;
     const MMRESULT opened = waveOutOpen(&output, device, &format, 0, 0, CALLBACK_NULL);
@@ -88,6 +89,9 @@ int play_audio(HANDLE input, UINT device) {
     for (auto &block : blocks) {
         if (!release(block)) return 1;
     }
+    const auto helper_timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - helper_start).count();
+    std::cerr << "SKYBER_AUDIO_DRAINED " << delivered << " " << helper_timestamp_us << '\n';
     std::cerr << "Played " << delivered << " stereo sample frames\n";
     return delivered ? 0 : 1;
 }

@@ -363,6 +363,15 @@ def run_case(
                             f"{track} viewer did not report presentation")
             require("stereo sample frames" in read_stderr(output, "initiator"),
                     "audio helper did not report completed playback")
+            audio = read_result(output, "initiator")["tracks"]
+            audio = next(row for row in audio if row["track"] == "microphone")
+            drain_events = audio.get("audio_drain_events", [])
+            require(len(drain_events) == 1
+                    and drain_events[0].get("sample_frames") == audio["samples"]
+                    and drain_events[0].get("helper_timestamp_us", 0) > 0
+                    and drain_events[0].get("helper_clock_domain")
+                        == "playback_helper_monotonic_us_since_start",
+                    "audio helper drain event does not match decoded sample frames")
         if failure is None and sys.platform == "win32":
             usage = {role: process_cpu_ms(peer.pid) for role, peer in peers.items()}
             (output / "cpu-ms.json").write_text(json.dumps(usage), encoding="utf-8")

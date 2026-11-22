@@ -62,6 +62,7 @@ def bus_result(bus: Gst.Bus, timeout: int = 0) -> Gst.Message | None:
 
 
 def audio(device: str | None) -> None:
+    helper_start_ns = time.monotonic_ns()
     pipeline, (source, volume, sink) = build_pipeline(("appsrc", "volume", "pulsesink"))
     source.set_property("caps", Gst.Caps.from_string(
         "audio/x-raw,format=S16LE,layout=interleaved,channels=2,rate=48000"
@@ -90,6 +91,9 @@ def audio(device: str | None) -> None:
             raise RuntimeError("cannot finish audio output")
         if bus_result(bus, 4 * Gst.SECOND) is None or not samples:
             raise RuntimeError("audio output did not drain")
+        helper_timestamp_us = (time.monotonic_ns() - helper_start_ns) // 1000
+        print(f"SKYBER_AUDIO_DRAINED {samples} {helper_timestamp_us}",
+              file=sys.stderr, flush=True)
         print(f"Played {samples} stereo sample frames", file=sys.stderr, flush=True)
     finally:
         pipeline.set_state(Gst.State.NULL)

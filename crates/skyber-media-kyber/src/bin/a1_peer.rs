@@ -218,6 +218,13 @@ struct PresentationEvent {
     helper_clock_domain: &'static str,
 }
 
+#[derive(Clone, Serialize)]
+struct AudioDrainEvent {
+    sample_frames: u64,
+    helper_timestamp_us: u64,
+    helper_clock_domain: &'static str,
+}
+
 #[derive(Default, Serialize)]
 struct PresentationSummary {
     clock_domain: &'static str,
@@ -419,6 +426,30 @@ fn parse_video_presentation_event(line: &str) -> Result<Option<PresentationEvent
     );
     Ok(Some(PresentationEvent {
         packet_id_us,
+        helper_timestamp_us,
+        helper_clock_domain: "playback_helper_monotonic_us_since_start",
+    }))
+}
+
+fn parse_audio_drain_event(line: &str) -> Result<Option<AudioDrainEvent>> {
+    let Some(rest) = line.strip_prefix("SKYBER_AUDIO_DRAINED ") else {
+        return Ok(None);
+    };
+    let mut fields = rest.split_ascii_whitespace();
+    let sample_frames = fields
+        .next()
+        .context("missing audio drain sample-frame count")?
+        .parse()?;
+    let helper_timestamp_us = fields
+        .next()
+        .context("missing audio drain helper timestamp")?
+        .parse()?;
+    ensure!(
+        fields.next().is_none(),
+        "unexpected audio drain event fields"
+    );
+    Ok(Some(AudioDrainEvent {
+        sample_frames,
         helper_timestamp_us,
         helper_clock_domain: "playback_helper_monotonic_us_since_start",
     }))
@@ -710,6 +741,7 @@ struct Observed {
     last_decoded_us: u64,
     timings: Vec<TimingSample>,
     presentation_events: Vec<PresentationEvent>,
+    audio_drain_events: Vec<AudioDrainEvent>,
     #[serde(skip_serializing_if = "presentation_summary_is_empty")]
     presentation_summary: PresentationSummary,
     timing_summary: TimingSummary,
@@ -731,7 +763,12 @@ async fn present(
     mut rx: mpsc::Receiver<PresentedPacket>,
     audio_output: Option<DeviceSelector>,
     origin: Instant,
-) -> Result<(usize, Vec<TimingSample>, Vec<PresentationEvent>)> {
+) -> Result<(
+    usize,
+    Vec<TimingSample>,
+    Vec<PresentationEvent>,
+    Vec<AudioDrainEvent>,
+)> {
     use std::process::Stdio;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -770,15 +807,18 @@ async fn present(
         .context("missing playback helper log pipe")?;
     let event_reader = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
-        let mut events = Vec::new();
+        let mut video_events = Vec::new();
+        let mut audio_events = Vec::new();
         while let Some(line) = lines.next_line().await? {
             if let Some(event) = parse_video_presentation_event(&line)? {
-                events.push(event);
+                video_events.push(event);
+            } else if let Some(event) = parse_audio_drain_event(&line)? {
+                audio_events.push(event);
             } else {
                 eprintln!("{line}");
             }
         }
-        Ok::<_, anyhow::Error>(events)
+        Ok::<_, anyhow::Error>((video_events, audio_events))
     });
     let mut delivered = 0;
     let mut dismissed = false;
@@ -836,10 +876,10 @@ async fn present(
         ensure!(child.wait().await?.success(), "playback helper failed");
     }
     ensure!(delivered > 0 || dismissed, "playback had no decoded output");
-    let presentation_events = event_reader
+    let (presentation_events, audio_drain_events) = event_reader
         .await
         .context("read presentation helper events")??;
-    Ok((delivered, timings, presentation_events))
+    Ok((delivered, timings, presentation_events, audio_drain_events))
 }
 
 fn decode_track(
@@ -974,14 +1014,15 @@ async fn subscribe(
         if playback {
             present(track, output, audio_output, origin).await
         } else {
-            Ok((0, Vec::new(), Vec::new()))
+            Ok((0, Vec::new(), Vec::new(), Vec::new()))
         }
     };
     let decode = async { worker.await? };
-    let (_, (delivered, playback_timings, presentation_events), mut observed) =
+    let (_, (delivered, playback_timings, presentation_events, audio_drain_events), mut observed) =
         tokio::try_join!(receive, render, decode)?;
     observed.playback_bytes = delivered;
     observed.presentation_events = presentation_events;
+    observed.audio_drain_events = audio_drain_events;
     observed.presentation_summary = presentation_summary(&observed.presentation_events);
     let playback: std::collections::HashMap<_, _> = playback_timings
         .into_iter()
@@ -1182,7 +1223,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod timing_tests {
     use super::{
-        PresentationEvent, TimingSample, TransportSample, packet_rate,
+        PresentationEvent, TimingSample, TransportSample, packet_rate, parse_audio_drain_event,
         parse_video_presentation_event, percentiles, presentation_summary, timing_summary,
         transport_report,
     };
@@ -1200,6 +1241,20 @@ mod timing_tests {
                 .is_none()
         );
         assert!(parse_video_presentation_event("SKYBER_PRESENT_VIDEO nope 456").is_err());
+    }
+
+    #[test]
+    fn parse_audio_output_drain_event() {
+        let event = parse_audio_drain_event("SKYBER_AUDIO_DRAINED 9600 123456")
+            .expect("valid event")
+            .expect("recognized event");
+        assert_eq!(event.sample_frames, 9600);
+        assert_eq!(event.helper_timestamp_us, 123456);
+        assert_eq!(
+            event.helper_clock_domain,
+            "playback_helper_monotonic_us_since_start"
+        );
+        assert!(parse_audio_drain_event("SKYBER_AUDIO_DRAINED bad 10").is_err());
     }
 
     #[test]
