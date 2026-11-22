@@ -178,20 +178,11 @@ static void generate_video(A1Codec *codec) {
     }
 }
 
-int32_t a1_encode(A1Codec *codec, uint8_t *out, uint32_t capacity, uint32_t *key) {
-    int result = av_frame_make_writable(codec->frame);
-    if (result < 0) {
-        return result;
-    }
-    if (codec->track == A1_MICROPHONE) {
-        generate_audio(codec);
-        codec->frame->pts = codec->number * AUDIO_SAMPLES;
-    } else {
-        generate_video(codec);
-        codec->frame->pts = codec->number;
-    }
+static int32_t encode_frame(A1Codec *codec, uint8_t *out, uint32_t capacity, uint32_t *key) {
+    codec->frame->pts = codec->track == A1_MICROPHONE
+        ? codec->number * AUDIO_SAMPLES : codec->number;
     ++codec->number;
-    result = avcodec_send_frame(codec->ctx, codec->frame);
+    int result = avcodec_send_frame(codec->ctx, codec->frame);
     if (result < 0) {
         return result;
     }
@@ -211,6 +202,58 @@ int32_t a1_encode(A1Codec *codec, uint8_t *out, uint32_t capacity, uint32_t *key
     *key = (codec->packet->flags & AV_PKT_FLAG_KEY) != 0;
     av_packet_unref(codec->packet);
     return size;
+}
+
+int32_t a1_encode(A1Codec *codec, uint8_t *out, uint32_t capacity, uint32_t *key) {
+    if (!codec || !av_codec_is_encoder(codec->ctx->codec) || !out || !key) {
+        return AVERROR(EINVAL);
+    }
+    const int result = av_frame_make_writable(codec->frame);
+    if (result < 0) {
+        return result;
+    }
+    if (codec->track == A1_MICROPHONE) {
+        generate_audio(codec);
+    } else {
+        generate_video(codec);
+    }
+    return encode_frame(codec, out, capacity, key);
+}
+
+int32_t skyber_encode_pcm_f32(A1Codec *codec, const float *samples, uint32_t count,
+                             uint8_t *out, uint32_t capacity, uint32_t *key) {
+    if (!codec || codec->track != A1_MICROPHONE || !av_codec_is_encoder(codec->ctx->codec)
+        || !samples || count != AUDIO_SAMPLES * 2 || !out || !key) {
+        return AVERROR(EINVAL);
+    }
+    const int result = av_frame_make_writable(codec->frame);
+    if (result < 0) {
+        return result;
+    }
+    memcpy(codec->frame->data[0], samples, count * sizeof(*samples));
+    return encode_frame(codec, out, capacity, key);
+}
+
+int32_t skyber_encode_i420(A1Codec *codec, const uint8_t *pixels, uint32_t size,
+                           uint8_t *out, uint32_t capacity, uint32_t *key) {
+    if (!codec || codec->track == A1_MICROPHONE || !av_codec_is_encoder(codec->ctx->codec)
+        || !pixels || size != WIDTH * HEIGHT * 3 / 2 || !out || !key) {
+        return AVERROR(EINVAL);
+    }
+    const int result = av_frame_make_writable(codec->frame);
+    if (result < 0) {
+        return result;
+    }
+    for (int plane = 0; plane < 3; ++plane) {
+        const int width = plane == 0 ? WIDTH : WIDTH / 2;
+        const int height = plane == 0 ? HEIGHT : HEIGHT / 2;
+        for (int row = 0; row < height; ++row) {
+            memcpy(codec->frame->data[plane] + row * codec->frame->linesize[plane],
+                   pixels, width);
+            pixels += width;
+        }
+    }
+    return encode_frame(codec, out, capacity, key);
 }
 
 static int read_audio(A1Codec *codec, A1Decoded *out) {

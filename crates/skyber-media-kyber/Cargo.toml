@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-a1-native = []
+a1-native = ["tokio/process", "tokio/io-util"]
 
 [dependencies]
 anyhow.workspace = true

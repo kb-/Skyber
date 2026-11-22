@@ -28,6 +28,11 @@ A1_API int32_t a1_encoder_open(uint32_t track, uint32_t source, A1Codec **out);
 A1_API int32_t a1_decoder_open(uint32_t track, const uint8_t *config, uint32_t size, A1Codec **out);
 A1_API int32_t a1_encoder_config(const A1Codec *codec, uint8_t *out, uint32_t capacity);
 A1_API int32_t a1_encode(A1Codec *codec, uint8_t *out, uint32_t capacity, uint32_t *key);
+/* Inputs are borrowed for the call and copied into encoder-owned frames. */
+A1_API int32_t skyber_encode_pcm_f32(A1Codec *codec, const float *samples, uint32_t count,
+                                     uint8_t *out, uint32_t capacity, uint32_t *key);
+A1_API int32_t skyber_encode_i420(A1Codec *codec, const uint8_t *pixels, uint32_t size,
+                                 uint8_t *out, uint32_t capacity, uint32_t *key);
 A1_API int32_t a1_decode(A1Codec *codec, const uint8_t *data, uint32_t size, A1Decoded *out);
 A1_API void a1_codec_close(A1Codec *codec);
 

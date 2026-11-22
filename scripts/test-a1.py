@@ -113,6 +113,31 @@ def verify_media(output: Path, profile: str, direction: str, stop_screen: bool, 
         print(f"{output.name} decoded overlap {(ended - began) / 1_000_000:.3f}s", flush=True)
 
 
+def verify_live_media(output: Path, *, stop_screen: bool) -> None:
+    published = read_result(output, "listener")["tracks"]
+    received = read_result(output, "initiator")["tracks"]
+    sent = {row["track"]: row["sent_packets"] for row in published}
+    incoming = {row["track"]: row for row in received}
+    expected = {"microphone", "camera", "screen"} if stop_screen else {"microphone", "camera"}
+    require(set(sent) == set(incoming) == expected, "unexpected live tracks")
+    for track, row in incoming.items():
+        require(row["received_packets"] == sent[track] and row["decoded_frames"] > 0,
+                f"live {track} failed to decode or lost packets")
+    require(incoming["microphone"]["samples"] > 0, "microphone decoded no samples")
+    if stop_screen:
+        screen = incoming["screen"]
+        require(screen["fingerprint"] != incoming["camera"]["fingerprint"],
+                "screen and camera decoded alike")
+        overlap = min(row["last_decoded_us"] for row in incoming.values()) - max(
+            row["first_decoded_us"] for row in incoming.values()
+        )
+        require(overlap >= 2_000_000, "less than two seconds of concurrent live media")
+        for track in ("microphone", "camera"):
+            require(incoming[track]["last_decoded_us"] - screen["last_decoded_us"] >= 500_000,
+                    f"{track} did not continue after screen sharing stopped")
+    print("Live tracks and packet counts verified", flush=True)
+
+
 def run_case(
     peer_exe: Path,
     output: Path,
@@ -122,6 +147,7 @@ def run_case(
     duration: int = 5800,
     screen_stop: int | None = None,
     failure: str | None = None,
+    capture: dict | None = None,
 ) -> None:
     output.mkdir()
     with tempfile.TemporaryDirectory(prefix="skyber-a1-") as tmp, ExitStack() as cleanup:
@@ -162,6 +188,11 @@ def run_case(
                 "duration_ms": duration,
                 "screen_stop_ms": screen_stop,
             }
+            live = capture is not None and role == "listener"
+            if capture is not None:
+                config["capture_wait_ms"] = 63000
+            if live:
+                config["capture"] = capture
             if role == "initiator" and failure == "auth":
                 config["secret"] = secrets.token_hex(24)
             if role == "initiator" and failure == "certificate":
@@ -172,7 +203,7 @@ def run_case(
             stdout = cleanup.enter_context((output / f"{role}.stdout").open("wb"))
             stderr = cleanup.enter_context((output / f"{role}.stderr").open("wb"))
             peer = subprocess.Popen(
-                [str(peer_exe), str(work)],
+                [str(peer_exe), *(["--capture"] if live else []), str(work)],
                 stdout=stdout,
                 stderr=stderr,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -185,7 +216,7 @@ def run_case(
         if failure == "hangup":
             await_marker(listener / "microphone.receiving", peers["listener"], time.monotonic() + 6)
             stop_process(peers["initiator"])
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + (85 if capture is not None else 20)
         for role, peer in peers.items():
             status = peer.wait(timeout=max(0.1, deadline - time.monotonic()))
             require((status == 0) == (failure is None), f"{role} unexpected exit {status}")
@@ -200,7 +231,14 @@ def run_case(
                 any("unexpected remote" in read_stderr(output, role) for role in ROLES),
                 "neither peer rejected the mismatched track map",
             )
-        if failure is None:
+        if failure == "capture_cancelled":
+            require("Screen selection cancelled" in read_stderr(output, "listener"),
+                    "screen picker did not report cancellation")
+            require(not any((directory / "initiator").glob("*.receiving")),
+                    "media was received after cancelling consent")
+        if failure is None and capture is not None:
+            verify_live_media(output, stop_screen=screen_stop is not None)
+        if failure is None and capture is None:
             verify_media(output, profile, direction, screen_stop is not None, lan=sys.platform != "win32")
         if failure is None and sys.platform == "win32":
             usage = {role: process_cpu_ms(peer.pid) for role, peer in peers.items()}
