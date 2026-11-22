@@ -44,6 +44,12 @@ The mandatory **audio** proof must select a physical Windows microphone rather t
 
 Run equivalent native Linux source and playback trials when its real capture device and desktop session are available. The Ubuntu VM may validate synthetic media and software decoding. Do not count VM physical microphone failure as a Kyber codec result. Do not claim cross-platform hardware support without a successful platform-specific run.
 
+## Windows native build attempt (2026-11-22)
+
+The pinned Windows cross-build was attempted with Meson 1.12.1, Ninja 1.13.2, pkgconf 3.0.7, NASM 2.16.02, and the installed x86_64 MinGW-w64 8.1.0 compiler. The `libavconv` and `txproto` checkouts match the revisions above. Meson configured the VPL 2.10.1 and NVENC header subprojects, then stopped while building the pinned x264 fallback. Its configure enables OpenCL, and the generated out-of-tree Makefile fails with `No rule to make target 'common/opencl/x264-cl.h'`; the header exists in x264's source tree, but this generated dependency is resolved relative to the separate build directory. The build-only `MAKE` path inherited from GnuWin32 also required overriding because it contained spaces; that override allowed configuration to reach x264.
+
+This is a build feasibility result, not a Kyber media proof: kymedia has not completed compilation, no Skyber webcam or microphone frames were processed, and no Kyber decode or presentation was exercised. No upstream source or Skyber production code was modified to work around the x264 failure. Next investigate an upstream-supported x264 configuration that avoids the broken out-of-tree OpenCL target, or use Kyber's supported full Windows build environment. Hardware acceleration, A/V sync, latency, resource use and visible video remain unverified.
+
 ## Experimental media modes
 
 Keep `Auto (upstream-informed)` and the compatible manual protocol choices for each track. Treat unreliable microphone, GOP-streamed webcam and reliable screen share as experimental profiles. Resolve Auto deterministically from supported local modes and authenticated peer compatibility. Preserve the effective selection in diagnostics and reject mismatched or unsupported proposals before creating media endpoints. A preference change applies to the next call. Preserve reliable audio/video endpoint coverage as a regression baseline.
