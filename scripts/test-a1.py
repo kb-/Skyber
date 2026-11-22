@@ -183,6 +183,21 @@ def verify_timing(row: dict) -> None:
             "timing clock domain is missing or changed")
     if row["sent_packets"]:
         require(len(samples) == row["sent_packets"], "published timing sample count changed")
+        if row.get("encoder_backend") == "kyber-avconv-libx264":
+            require(summary["encode_us"]["samples"] == 0
+                    and summary["transport_send_us"]["samples"] == row["sent_packets"],
+                    "upstream timing must report transport only")
+            packet_ids = [sample.get("packet_id_us") for sample in samples]
+            require(all(isinstance(value, int) for value in packet_ids)
+                    and all(left < right for left, right in zip(packet_ids, packet_ids[1:])),
+                    "upstream packet PTS values are not increasing")
+            for sample in samples:
+                require(all(isinstance(sample.get(name), int) for name in (
+                    "transport_send_start_us", "transport_send_end_us")),
+                    "upstream packet is missing transport timestamps")
+                require(sample["transport_send_start_us"] <= sample["transport_send_end_us"],
+                        "upstream transport timestamps are out of order")
+            return
         require(summary["encode_us"]["samples"] == row["sent_packets"]
                 and summary["transport_send_us"]["samples"] == row["sent_packets"],
                 "published stage sample count changed")
@@ -347,6 +362,7 @@ def run_case(
     playback: bool = False,
     audio_output: int | str | None = None,
     sustained: bool = False,
+    upstream_avconv_frames: int | None = None,
 ) -> None:
     output.mkdir()
     with tempfile.TemporaryDirectory(prefix="skyber-a1-") as tmp, ExitStack() as cleanup:
@@ -397,6 +413,8 @@ def run_case(
                 config["capture_wait_ms"] = 63000
             if live:
                 config["capture"] = capture
+            if upstream_avconv_frames is not None and role == "listener":
+                config["upstream_avconv_frames"] = upstream_avconv_frames
             if role == "initiator" and failure == "auth":
                 config["secret"] = secrets.token_hex(24)
             if role == "initiator" and failure == "certificate":
@@ -442,7 +460,13 @@ def run_case(
             require("Certificate hash mismatch" in read_stderr(output, "initiator"), "wrong TLS error")
         if failure == "track_map":
             require(
-                any("unexpected remote" in read_stderr(output, role) for role in ROLES),
+                any(
+                    any(message in read_stderr(output, role) for message in (
+                        "unexpected remote",
+                        "peer did not configure",
+                    ))
+                    for role in ROLES
+                ),
                 "neither peer rejected the mismatched track map",
             )
         if failure == "capture_cancelled":
@@ -526,13 +550,26 @@ def main() -> None:
     parser.add_argument("peer", type=Path)
     parser.add_argument("--output", type=Path, default=Path("target/a1/runs"))
     parser.add_argument("--audio-only", action="store_true")
+    parser.add_argument("--upstream-avconv-frames", type=int,
+                        help="run the synthetic Kyber avconv video through Kymux instead of the full suite")
+    parser.add_argument("--playback", action="store_true",
+                        help="show the received test video using the existing A1 presentation helper")
     args = parser.parse_args()
     peer_exe = args.peer.resolve(strict=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     output = args.output / stamp
     output.mkdir(parents=True)
     print(f"Gate A1 results directory {output}", flush=True)
-    run_suite(peer_exe, output, args.audio_only)
+    if args.upstream_avconv_frames is not None:
+        require(1 <= args.upstream_avconv_frames <= 9000,
+                "upstream avconv frame count must be 1..9000")
+        run_case(peer_exe, output / "upstream-avconv-video", available_port(),
+                 "av", "listener", duration=10_000, playback=args.playback,
+                 upstream_avconv_frames=args.upstream_avconv_frames)
+        verify_media(output / "upstream-avconv-video", "av", "listener", False)
+    else:
+        require(not args.playback, "--playback requires --upstream-avconv-frames")
+        run_suite(peer_exe, output, args.audio_only)
 
 
 def run_suite(peer_exe: Path, output: Path, audio_only: bool = False) -> None:

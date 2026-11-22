@@ -83,6 +83,8 @@ struct Settings {
     capture_wait_ms: u64,
     #[serde(default)]
     playback_drain_timeout_ms: u64,
+    #[serde(default)]
+    upstream_avconv_frames: Option<usize>,
     audio_output: Option<DeviceSelector>,
 }
 
@@ -111,12 +113,18 @@ impl DeviceSelector {
 #[derive(Clone)]
 enum Input {
     Synthetic,
+    UpstreamAvconvSynthetic(usize),
     Device(DeviceSelector),
     ScreenPicker,
 }
 
 impl Settings {
     fn input(&self, track: Track) -> Input {
+        if track == Track::Camera
+            && let Some(frames) = self.upstream_avconv_frames
+        {
+            return Input::UpstreamAvconvSynthetic(frames);
+        }
         match (&self.capture, track) {
             (Some(capture), Track::Microphone) => Input::Device(capture.microphone.clone()),
             (Some(capture), Track::Camera) => Input::Device(capture.camera.clone()),
@@ -159,6 +167,15 @@ impl Settings {
             config.capture_wait_ms <= 65_000,
             "capture setup allowance exceeds 65 seconds"
         );
+        if let Some(frames) = config.upstream_avconv_frames {
+            ensure!(
+                (1..=9000).contains(&frames)
+                    && !matches!(config.profile, Profile::Audio)
+                    && config.direction.sends(config.role)
+                    && config.capture.is_none(),
+                "upstream avconv input requires a sending video peer, 1..=9000 frames and no live capture"
+            );
+        }
         if let Some(capture) = &config.capture {
             ensure!(
                 capture.microphone.matches_platform()
@@ -682,6 +699,9 @@ async fn capture_frames(
             command.args([if cfg!(windows) { "--screen" } else { "screen" }, &duration]);
         }
         Input::Synthetic => anyhow::bail!("synthetic input does not start a capture helper"),
+        Input::UpstreamAvconvSynthetic(_) => {
+            anyhow::bail!("upstream avconv input uses its dedicated publisher")
+        }
     }
     let mut child = command
         .stdin(Stdio::null())
@@ -741,6 +761,12 @@ async fn publish(
     remote_screen_ready: Option<watch::Receiver<bool>>,
     origin: Instant,
 ) -> Result<Observed> {
+    let input = match input {
+        Input::UpstreamAvconvSynthetic(frames) => {
+            return publish_upstream_avconv((track, endpoint), frames, origin).await;
+        }
+        input => input,
+    };
     let mut protocol = endpoint.ready().await?;
     let (tx, mut rx) = mpsc::channel(2);
     let (raw_tx, raw_rx) = mpsc::channel(2);
@@ -798,9 +824,157 @@ async fn publish(
     })
 }
 
+async fn publish_upstream_avconv(
+    (track, endpoint): Outbound,
+    frames: usize,
+    origin: Instant,
+) -> Result<Observed> {
+    use std::process::Stdio;
+    use tokio::{io::AsyncReadExt, process::Command};
+
+    ensure!(
+        track == Track::Camera,
+        "upstream avconv spike supports webcam video only"
+    );
+    ensure!(
+        cfg!(windows),
+        "upstream avconv probe is currently built for Windows only"
+    );
+    let executable = std::env::current_exe()?.with_file_name("skyber-avconv-frame-probe.exe");
+    let frame_count = frames.to_string();
+    let mut child = Command::new(executable)
+        .args(["--emit", "--synthetic", frame_count.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start pinned Kyber avconv video probe")?;
+    let mut stdout = child.stdout.take().context("missing avconv output pipe")?;
+    let mut stderr = child.stderr.take().context("missing avconv log pipe")?;
+    let stderr_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).await?;
+        Ok::<_, std::io::Error>(output)
+    });
+
+    let mut magic = [0; 8];
+    stdout
+        .read_exact(&mut magic)
+        .await
+        .context("read avconv stream signature")?;
+    ensure!(&magic == b"SKYAVC01", "invalid avconv stream signature");
+    let mut protocol = endpoint.ready().await?;
+    let mut codec_config_received = false;
+    let mut sent_packets = 0_u32;
+    let mut last_pts_us = 0_u64;
+    let mut timings = Vec::with_capacity(frames);
+
+    loop {
+        let record_type = match stdout.read_u8().await {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error).context("read avconv record type"),
+        };
+        let mut rest = [0; 13];
+        stdout
+            .read_exact(&mut rest)
+            .await
+            .context("read avconv record header")?;
+        let pts_us = u64::from_le_bytes(rest[..8].try_into()?);
+        ensure!(rest[8] <= 1, "invalid avconv keyframe flag");
+        let is_key = rest[8] != 0;
+        ensure!(
+            record_type == 1 || record_type == 2,
+            "unknown avconv record type"
+        );
+        let size = u32::from_le_bytes(rest[9..13].try_into()?) as usize;
+        let limit = if record_type == 1 {
+            MAX_CONFIG
+        } else {
+            MAX_PACKET
+        };
+        ensure!(
+            size > 0 && size <= limit,
+            "avconv record size exceeds its bound"
+        );
+        let mut payload = vec![0; size];
+        stdout
+            .read_exact(&mut payload)
+            .await
+            .context("read avconv packet payload")?;
+
+        match record_type {
+            1 => {
+                ensure!(
+                    !codec_config_received && sent_packets == 0 && pts_us == 0 && !is_key,
+                    "invalid or repeated avconv codec configuration"
+                );
+                protocol
+                    .send(types::AVPacket::Codec(types::CodecPacket {
+                        header: types::CodecPacketHeader {
+                            codec: codec(Track::Camera),
+                            rotation: 0,
+                            frame_size: 0,
+                        },
+                    }))
+                    .await?;
+                protocol
+                    .send(media(0, Bytes::from(payload), true, false)?)
+                    .await?;
+                codec_config_received = true;
+            }
+            2 => {
+                ensure!(
+                    codec_config_received,
+                    "avconv media preceded codec configuration"
+                );
+                ensure!(
+                    sent_packets < frames as u32 && pts_us <= (frames as u64 * 1_000_000 / 15) + 1,
+                    "avconv emitted more frames or a timestamp beyond the requested source"
+                );
+                ensure!(pts_us > last_pts_us, "avconv timestamps are not increasing");
+                let mut timing = TimingSample {
+                    packet_id_us: pts_us,
+                    ..TimingSample::default()
+                };
+                timing.transport_send_start_us = Some(elapsed_micros(origin)?);
+                protocol
+                    .send(media(pts_us, Bytes::from(payload), false, is_key)?)
+                    .await?;
+                timing.transport_send_end_us = Some(elapsed_micros(origin)?);
+                timings.push(timing);
+                last_pts_us = pts_us;
+                sent_packets += 1;
+            }
+            _ => anyhow::bail!("unsupported avconv record type {record_type}"),
+        }
+    }
+
+    ensure!(
+        codec_config_received && sent_packets == frames as u32,
+        "avconv did not emit the requested configured video frame count"
+    );
+    let exit = child.wait().await.context("wait for avconv probe")?;
+    let diagnostic = stderr_task.await.context("join avconv log reader")??;
+    eprint!("{}", String::from_utf8_lossy(&diagnostic));
+    ensure!(exit.success(), "Kyber avconv probe failed with {exit}");
+    let summary = timing_summary(&timings);
+    Ok(Observed {
+        track: track.label(),
+        sent_packets,
+        timings,
+        timing_summary: summary,
+        encoder_backend: Some("kyber-avconv-libx264"),
+        ..Observed::default()
+    })
+}
+
 #[derive(Default, Serialize)]
 struct Observed {
     track: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoder_backend: Option<&'static str>,
     sent_packets: u32,
     received_packets: usize,
     decoded_frames: u32,
