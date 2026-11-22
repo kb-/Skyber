@@ -29,7 +29,7 @@ use tokio_tungstenite::{
 /// to accept an unvalidated certificate.
 pub struct TlsRelayWebSocketConnector {
     endpoint: String,
-    tls_config: Arc<rustls::ClientConfig>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl TlsRelayWebSocketConnector {
@@ -38,23 +38,39 @@ impl TlsRelayWebSocketConnector {
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Result<Self, String> {
         let endpoint = endpoint.into();
-        let authority_and_path = endpoint
-            .strip_prefix("wss://")
-            .ok_or_else(|| "relay endpoint must use wss://".to_owned())?;
-        let authority = authority_and_path.split('/').next().unwrap_or_default();
-        if authority.is_empty()
-            || authority.contains('@')
-            || endpoint.contains('?')
-            || endpoint.contains('#')
-            || endpoint.chars().any(char::is_whitespace)
-        {
-            return Err("relay endpoint contains invalid or secret-bearing URL fields".to_owned());
-        }
+        validate_relay_endpoint(&endpoint)?;
         Ok(Self {
             endpoint,
-            tls_config,
+            tls_config: Some(tls_config),
         })
     }
+
+    /// Use the platform's native CA store for relay certificate validation.
+    /// This requires the `tokio-tungstenite` native-root TLS feature.
+    pub fn with_platform_roots(endpoint: impl Into<String>) -> Result<Self, String> {
+        let endpoint = endpoint.into();
+        validate_relay_endpoint(&endpoint)?;
+        Ok(Self {
+            endpoint,
+            tls_config: None,
+        })
+    }
+}
+
+fn validate_relay_endpoint(endpoint: &str) -> Result<(), String> {
+    let authority_and_path = endpoint
+        .strip_prefix("wss://")
+        .ok_or_else(|| "relay endpoint must use wss://".to_owned())?;
+    let authority = authority_and_path.split('/').next().unwrap_or_default();
+    if authority.is_empty()
+        || authority.contains('@')
+        || endpoint.contains('?')
+        || endpoint.contains('#')
+        || endpoint.chars().any(char::is_whitespace)
+    {
+        return Err("relay endpoint contains invalid or secret-bearing URL fields".to_owned());
+    }
+    Ok(())
 }
 
 impl RelayWebSocketConnector for TlsRelayWebSocketConnector {
@@ -68,7 +84,9 @@ impl RelayWebSocketConnector for TlsRelayWebSocketConnector {
                 self.endpoint.as_str(),
                 None,
                 true,
-                Some(Connector::Rustls(Arc::clone(&self.tls_config))),
+                self.tls_config
+                    .as_ref()
+                    .map(|config| Connector::Rustls(Arc::clone(config))),
             )
             .await
             .map_err(|error| format!("WSS relay connection failed: {error}"))?;
@@ -779,6 +797,16 @@ mod tests {
             .is_err()
         );
         assert!(super::TlsRelayWebSocketConnector::new("wss://relay.example/relay", tls).is_ok());
+        assert!(
+            super::TlsRelayWebSocketConnector::with_platform_roots("wss://relay.example/relay")
+                .is_ok()
+        );
+        assert!(
+            super::TlsRelayWebSocketConnector::with_platform_roots(
+                "wss://user@relay.example/relay"
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
