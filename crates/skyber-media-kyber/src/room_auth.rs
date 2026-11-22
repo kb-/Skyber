@@ -167,3 +167,77 @@ fn proof_message(role: u8, peers: AuthenticatedPeers, exporter: &[u8; 32]) -> Ve
     message.extend_from_slice(exporter);
     message
 }
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+    use skyber_signaling::{AuthenticatedPeers, PeerIdentity, RoomId};
+
+    use super::proof_message;
+
+    fn fixture() -> (AuthenticatedPeers, SigningKey, SigningKey, [u8; 32]) {
+        let inviter = SigningKey::from_bytes(&[11; 32]);
+        let invitee = SigningKey::from_bytes(&[22; 32]);
+        let peers = AuthenticatedPeers {
+            room: RoomId::from_bytes([7; 16]),
+            inviter: PeerIdentity::from_signing_key(&inviter),
+            invitee: PeerIdentity::from_signing_key(&invitee),
+        };
+        (peers, inviter, invitee, [33; 32])
+    }
+
+    #[test]
+    fn peer_proofs_bind_room_role_identities_and_tls_exporter() {
+        let (peers, inviter, invitee, exporter) = fixture();
+        let inviter_proof = proof_message(0, peers, &exporter);
+        let invitee_proof = proof_message(1, peers, &exporter);
+        let inviter_signature = inviter.sign(&inviter_proof);
+        let invitee_signature = invitee.sign(&invitee_proof);
+
+        VerifyingKey::from_bytes(peers.inviter.as_bytes())
+            .expect("fixture inviter key is valid")
+            .verify(&inviter_proof, &inviter_signature)
+            .expect("inviter proof verifies");
+        VerifyingKey::from_bytes(peers.invitee.as_bytes())
+            .expect("fixture invitee key is valid")
+            .verify(&invitee_proof, &invitee_signature)
+            .expect("invitee proof verifies");
+
+        let mut other_room = peers;
+        other_room.room = RoomId::from_bytes([8; 16]);
+        assert!(
+            VerifyingKey::from_bytes(peers.inviter.as_bytes())
+                .expect("fixture inviter key is valid")
+                .verify(&proof_message(0, other_room, &exporter), &inviter_signature)
+                .is_err()
+        );
+
+        assert!(
+            VerifyingKey::from_bytes(peers.invitee.as_bytes())
+                .expect("fixture invitee key is valid")
+                .verify(&proof_message(0, peers, &exporter), &invitee_signature)
+                .is_err()
+        );
+
+        let other_exporter = [34; 32];
+        assert!(
+            VerifyingKey::from_bytes(peers.inviter.as_bytes())
+                .expect("fixture inviter key is valid")
+                .verify(
+                    &proof_message(0, peers, &other_exporter),
+                    &inviter_signature
+                )
+                .is_err()
+        );
+
+        let impersonator = SigningKey::from_bytes(&[44; 32]);
+        let impersonated_proof = proof_message(0, peers, &exporter);
+        let impersonated_signature = impersonator.sign(&impersonated_proof);
+        assert!(
+            VerifyingKey::from_bytes(peers.inviter.as_bytes())
+                .expect("fixture inviter key is valid")
+                .verify(&impersonated_proof, &impersonated_signature)
+                .is_err()
+        );
+    }
+}
