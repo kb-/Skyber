@@ -1,8 +1,9 @@
 # Gate C-0 — authenticated direct connectivity probe
 
-**Status:** Probe implemented; Ubuntu IPv4/IPv6 and Windows IPv4 loopback
-authentication checks pass. A direct IPv4 exchange from Windows over 4G to the
-Ubuntu home lab also passes. Windows IPv6 listener binding remains unverified.
+**Status:** Gate C-0 is open. Ubuntu IPv4/IPv6 and Windows IPv4 loopback
+authentication checks pass, as does a direct IPv4 exchange from Windows over
+4G to the Ubuntu home lab. The Windows IPv6 listener bind failed, and public
+IPv6 still needs validation where available.
 **Kyber revision:** `kymux` `af10dbb3ea016135c0ec8e01143179ad4bda005b`.
 
 ## Scope and security boundary
@@ -83,8 +84,9 @@ host and allow that port only from the testing client's current public source
 address in the host firewall. The client uses the router's public IPv4 address
 and port with `--internet`. For IPv6, use the server's selected global IPv6
 address and a source-scoped firewall allowance; no router port forward is
-needed. Transfer the token and certificate pin out of band. Remove the
-temporary forward and firewall allowance immediately after the one-shot probe.
+needed. Transfer the token and certificate pin out of band. Keep the narrow
+forward and firewall allowance for active Gate C-0 testing. Update the allowed
+source if the mobile address changes, and remove the rules when testing ends.
 
 The 4G hotspot is reserved for the final independent-network attempt. Do not
 enable a DMZ, forward a media port, or expose a media decoder for this proof.
@@ -114,7 +116,8 @@ Do not replace the specific bind with `[::]` for a loopback test; that would
 listen on every IPv6 interface. Investigate a narrow upstream-compatible
 Windows IPv6 bind path before claiming Windows IPv6 support.
 
-The direct IPv4 exchange validates authenticated public connectivity for this
-endpoint pair. It does not test NAT traversal, relay behavior, IPv6, or
-production media. Gate C-0 remains open until Windows IPv6 is resolved.
-Gate C-1 discovery, NAT traversal, and relay work remain separate.
+To close Gate C-0, resolve the Windows IPv6 listener bind and repeat the
+authenticated IPv6 loopback exchange. Then run the public IPv6 probe if the
+test endpoints have an independent IPv6 path. Record the network limitation
+explicitly if that path is unavailable. Gate C-1 covers peer discovery, NAT
+traversal, and relay fallback.

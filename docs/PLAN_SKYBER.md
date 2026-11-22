@@ -130,6 +130,10 @@ Detailed execution and acceptance plan: [Gate A2 — two physical PCs with Ubunt
 
 ### Gate C — real-network calls
 
+**Status:** Gate C is open. The authenticated synthetic probe passed over
+direct public IPv4 from Windows on 4G to Ubuntu. Gate C-0 still needs Windows
+IPv6 loopback and a public IPv6 check where available. Gate C-1 remains open.
+
 #### Gate C-0 — direct Internet connectivity proof
 
 Start with a standalone authenticated probe over Kyber's pinned Quinn transport.
