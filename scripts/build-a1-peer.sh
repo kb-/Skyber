@@ -12,3 +12,10 @@ export CARGO_NET_GIT_FETCH_WITH_CLI=true
 export SKYBER_A1_NATIVE_DIR="$output"
 cargo build --locked --release --target "$target" -p skyber-media-kyber --features a1-native
 install -m 755 "$CARGO_TARGET_DIR/$target/release/skyber-a1-peer.exe" "$output/"
+(
+    git rev-parse HEAD
+    rustc -Vv
+    x86_64-w64-mingw32-gcc --version
+    x86_64-w64-mingw32-objdump -p "$output/skyber_a1_codecs.dll" | sed -n '/DLL Name/p'
+    sha256sum "$output/skyber-a1-peer.exe" "$output/skyber_a1_codecs.dll"
+) > "$output/build-inventory.txt"

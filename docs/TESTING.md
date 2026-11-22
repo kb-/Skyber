@@ -31,7 +31,7 @@ Each subsystem exposes narrow, mockable interfaces (media capture, media sink, c
 
 ### Gate A2 — Windows 11 ↔ Linux
 
-- Two separate physical hosts on the same LAN; peer A Windows 11, peer B a supported Linux distribution (Ubuntu 24.04 LTS is a starting point, subject to Kyber device support).
+- Two separate physical hosts on the same LAN; peer A Windows 11, peer B Ubuntu 26.04.1 LTS Desktop, in VirtualBox for A2a and on bare metal for A2b.
 - Verify Linux display/session dependencies such as X11 vs Wayland and PipeWire/portal behavior for screen capture.
 - Use distinct physical camera/microphone/speaker devices; verify simultaneous capture and playback, echo cancellation and independent screen shares.
 - Test hardware encode/decode support on each host, 720p30 baseline, screen text readability, 1080p options where available.

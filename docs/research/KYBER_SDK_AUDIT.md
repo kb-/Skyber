@@ -105,3 +105,13 @@ and missing-export check also passed. The missing-DLL run returned status 1
 with Windows error 126. The probe verifies the narrow C ABI and caller-owned
 output. It leaves C++ objects, pointers with foreign allocator ownership, and
 native codec structs inside their respective modules.
+
+## A2-0 Ubuntu synthetic codec profile
+
+The Ubuntu x86-64 recipe uses the checksum-verified FFmpeg n8.1 release
+without the Windows patch set, with the same pinned x264 and Opus and the
+same application-owned C ABI. FFmpeg is configured with GPL version 3 and
+nonfree components disabled. The reduced static codec libraries are linked
+into the staged ELF shared library. The peer uses the existing pinned
+kymux source and reliable media endpoints. The Linux software profile
+requires a native build and a cross-platform run to establish compatibility.

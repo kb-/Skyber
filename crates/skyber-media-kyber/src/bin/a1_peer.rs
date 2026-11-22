@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use skyber_core::Track;
 use skyber_media_kyber::{
     native::{Decoder, Encoder, MAX_CONFIG, MAX_PACKET},
-    transport::{self, Inbound, Outbound, Role},
+    transport::{self, Inbound, LanAddress, Outbound, Role},
 };
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
@@ -59,6 +59,8 @@ struct Settings {
     role: Role,
     port: u16,
     fingerprint: String,
+    bind_address: Option<Ipv4Addr>,
+    remote_address: Option<Ipv4Addr>,
     secret: String,
     profile: Profile,
     direction: Direction,
@@ -75,7 +77,12 @@ impl Settings {
             "invalid port or run duration"
         );
         ensure!(
-            !config.secret.is_empty() && config.fingerprint.len() == 64,
+            (1..=256).contains(&config.secret.len())
+                && config.fingerprint.len() == 64
+                && config
+                    .fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
             "invalid authentication configuration"
         );
         if let Some(stop) = config.screen_stop_ms {
@@ -189,6 +196,7 @@ fn decode_track(
     track: Track,
     config: Bytes,
     mut rx: mpsc::Receiver<types::MediaPacket>,
+    origin: Option<Instant>,
 ) -> Result<Observed> {
     let mut decoder = Decoder::new(track, &config)?;
     let mut observed = Observed {
@@ -207,12 +215,17 @@ fn decode_track(
         let decoded = decoder.decode(&packet.payload)?;
         observed.received_packets += 1;
         if decoded.frames != 0 {
-            let now = wall_micros()?;
+            let now = match origin {
+                Some(start) => u64::try_from(start.elapsed().as_micros())? + 1,
+                None => wall_micros()?,
+            };
             if observed.first_decoded_us == 0 {
                 observed.first_decoded_us = now;
             }
             observed.last_decoded_us = now;
-            if let Some(elapsed) = now.checked_sub(last_pts) {
+            if origin.is_none()
+                && let Some(elapsed) = now.checked_sub(last_pts)
+            {
                 timings.push(elapsed);
             }
         }
@@ -234,7 +247,11 @@ fn decode_track(
     Ok(observed)
 }
 
-async fn subscribe((track, endpoint): Inbound, progress: PathBuf) -> Result<Observed> {
+async fn subscribe(
+    (track, endpoint): Inbound,
+    progress: PathBuf,
+    origin: Option<Instant>,
+) -> Result<Observed> {
     let mut protocol = endpoint.ready().await?;
     let Some(types::AVPacket::Codec(params)) = protocol.recv().await? else {
         anyhow::bail!("missing codec parameters");
@@ -251,7 +268,8 @@ async fn subscribe((track, endpoint): Inbound, progress: PathBuf) -> Result<Obse
         "invalid codec configuration"
     );
     let (tx, rx) = mpsc::channel(2);
-    let worker = tokio::task::spawn_blocking(move || decode_track(track, config.payload, rx));
+    let worker =
+        tokio::task::spawn_blocking(move || decode_track(track, config.payload, rx, origin));
     let network_result = async {
         let mut received = 0;
         while let Some(packet) = protocol.recv().await? {
@@ -280,89 +298,111 @@ async fn subscribe((track, endpoint): Inbound, progress: PathBuf) -> Result<Obse
     decoded
 }
 
-async fn run(directory: &Path) -> Result<()> {
+async fn run(directory: &Path, lan: bool) -> Result<()> {
     let config = Settings::load(directory)?;
     let role = config.role;
     let address: SocketAddr = (Ipv4Addr::LOCALHOST, config.port).into();
+    let lan_address = match (lan, role, config.bind_address, config.remote_address) {
+        (false, _, None, None) => None,
+        (true, Role::Listener, Some(ip), None) | (true, Role::Initiator, None, Some(ip)) => {
+            Some(LanAddress::new(ip, config.port)?)
+        }
+        _ => anyhow::bail!("invalid role-specific LAN addresses"),
+    };
     kynet::init_crypto();
     let server = if role == Role::Listener {
-        let server = transport::listen(
-            address,
-            &directory.join("cert.pem"),
-            &directory.join("key.pem"),
-        )
-        .await?;
+        let cert = directory.join("cert.pem");
+        let key = directory.join("key.pem");
+        let server = match lan_address {
+            Some(address) => transport::listen_lan(address, &cert, &key).await?,
+            None => transport::listen(address, &cert, &key).await?,
+        };
         std::fs::write(directory.join("ready"), b"listening")?;
         Some(server)
     } else {
         None
     };
-    let connection = timeout(SETUP_TIMEOUT, async {
+    let connect_timeout = if lan && server.is_some() {
+        Duration::from_secs(60)
+    } else {
+        SETUP_TIMEOUT
+    };
+    let connection = timeout(connect_timeout, async {
         if let Some(server) = &server {
             transport::accept(server, &config.secret).await
+        } else if let Some(address) = lan_address {
+            transport::connect_lan(address, config.fingerprint, &config.secret).await
         } else {
             transport::connect(address, config.fingerprint, &config.secret).await
         }
     })
     .await
     .context("Kyber connection timed out")??;
-    let remote_role = match role {
-        Role::Listener => Role::Initiator,
-        Role::Initiator => Role::Listener,
-    };
-    let selected = |role| {
-        if config.direction.sends(role) {
-            config.profile.tracks()
-        } else {
-            &[]
+    let result = async {
+        if lan {
+            tokio::fs::write(directory.join("authenticated"), b"authenticated").await?;
         }
-    };
-    let mut endpoints = timeout(
-        SETUP_TIMEOUT,
-        transport::register_tracks(&connection, role, selected(role), selected(remote_role)),
-    )
-    .await
-    .context("Kyber track registration timed out")??;
-
-    let duration = Duration::from_millis(config.duration_ms) + SETUP_TIMEOUT;
-    let result = timeout(duration, async {
-        let mut tasks = JoinSet::new();
-        let source = u32::from(role == Role::Initiator);
-        for endpoint in endpoints.outbound.drain(..) {
-            let duration_ms = if endpoint.0 == Track::Screen {
-                config.screen_stop_ms.unwrap_or(config.duration_ms)
+        let remote_role = match role {
+            Role::Listener => Role::Initiator,
+            Role::Initiator => Role::Listener,
+        };
+        let selected = |role| {
+            if config.direction.sends(role) {
+                config.profile.tracks()
             } else {
-                config.duration_ms
-            };
-            let track = endpoint.0;
-            tasks.spawn(async move {
-                publish(endpoint, source, duration_ms)
-                    .await
-                    .with_context(|| format!("publishing {}", track.label()))
-            });
-        }
-        for endpoint in endpoints.inbound.drain(..) {
-            let track = endpoint.0;
-            let progress = directory.join(format!("{}.receiving", track.label()));
-            tasks.spawn(async move {
-                subscribe(endpoint, progress)
-                    .await
-                    .with_context(|| format!("subscribing to {}", track.label()))
-            });
-        }
-        let mut observations = Vec::new();
-        while let Some(result) = tasks.join_next().await {
-            observations.push(result??);
-        }
-        endpoints.finish(role).await?;
-        Ok::<_, anyhow::Error>(observations)
-    })
-    .await
-    .context("Kyber media run timed out")?;
+                &[]
+            }
+        };
+        let mut endpoints = timeout(
+            SETUP_TIMEOUT,
+            transport::register_tracks(&connection, role, selected(role), selected(remote_role)),
+        )
+        .await
+        .context("Kyber track registration timed out")??;
 
-    if result.is_ok() && role == Role::Listener {
-        let _ = timeout(SETUP_TIMEOUT, connection.closed()).await;
+        let duration = Duration::from_millis(config.duration_ms) + SETUP_TIMEOUT;
+        let origin = (lan || cfg!(target_os = "linux")).then(Instant::now);
+        let result = timeout(duration, async {
+            let mut tasks = JoinSet::new();
+            let source = u32::from(role == Role::Initiator);
+            for endpoint in endpoints.outbound.drain(..) {
+                let duration_ms = if endpoint.0 == Track::Screen {
+                    config.screen_stop_ms.unwrap_or(config.duration_ms)
+                } else {
+                    config.duration_ms
+                };
+                let track = endpoint.0;
+                tasks.spawn(async move {
+                    publish(endpoint, source, duration_ms)
+                        .await
+                        .with_context(|| format!("publishing {}", track.label()))
+                });
+            }
+            for endpoint in endpoints.inbound.drain(..) {
+                let track = endpoint.0;
+                let progress = directory.join(format!("{}.receiving", track.label()));
+                tasks.spawn(async move {
+                    subscribe(endpoint, progress, origin)
+                        .await
+                        .with_context(|| format!("subscribing to {}", track.label()))
+                });
+            }
+            let mut observations = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                observations.push(result??);
+            }
+            endpoints.finish(role).await?;
+            Ok::<_, anyhow::Error>(observations)
+        })
+        .await
+        .context("Kyber media run timed out")?;
+
+        if result.is_ok() && role == Role::Listener {
+            let _ = timeout(SETUP_TIMEOUT, connection.closed()).await;
+        }
+        result
     }
+    .await;
     connection.close();
     println!(
         "{}",
@@ -373,8 +413,16 @@ async fn run(directory: &Path) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let directory = std::env::args_os()
-        .nth(1)
-        .context("usage: skyber-a1-peer RUN_DIRECTORY")?;
-    run(&PathBuf::from(directory)).await
+    let mut args = std::env::args_os().skip(1);
+    let first = args
+        .next()
+        .context("usage: skyber-a1-peer [--lan] RUN_DIRECTORY")?;
+    let lan = first == "--lan";
+    let directory = if lan {
+        args.next().context("missing run directory")?
+    } else {
+        first
+    };
+    ensure!(args.next().is_none(), "unexpected peer arguments");
+    run(&PathBuf::from(directory), lan).await
 }

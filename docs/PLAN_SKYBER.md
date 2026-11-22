@@ -113,7 +113,7 @@ Initial target: Windows 11 desktop; architect for Linux and macOS. One-to-one ca
 
 Detailed execution and acceptance plan: [Gate A2 — two physical PCs with Ubuntu in VirtualBox, then native Linux](PLAN_GATE_A2.md). The VM stage is **A2a**; native Linux hardware/compositor validation is **A2b** and remains required for full original A2 acceptance.
 
-1. Use the Windows 11 development computer as peer A, and a supported Linux desktop (preferably recent Ubuntu) as peer B. Verify exact Linux distribution, desktop session (X11/Wayland) and Kyber capture/codec support first.
+1. Use the Windows 11 development computer as peer A, and Ubuntu 26.04.1 LTS Desktop as peer B. Verify the desktop session (X11/Wayland) and Kyber capture/codec support first.
 2. Run bidirectional video and audio with independent physical capture/playback devices; add simultaneous webcam and screen share where Kyber supports it. Test Qt floating-window rendering on Windows, and preferably Linux too.
 3. Measure end-to-end glass-to-glass video latency, audio delay and A/V synchronization across a genuine LAN. Test acoustic echo cancellation, device changes, sustained calls, disconnect and reconnect.
 4. Record Linux-specific GPU capture/encode/decode limitations, cross-platform media negotiation, timestamps and transport issues. Deliver a reproducible two-host demo and go/no-go decision.
