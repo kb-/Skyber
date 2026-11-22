@@ -18,8 +18,11 @@ kymux = { git = "https://gitlab.com/kyber/core/kymux.git", rev = "af10dbb3ea0161
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 skyber-core = { path = "crates/skyber-core" }
+subtle = "2.6"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+getrandom = "0.4"
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+zeroize = "1.9"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -1,5 +1,6 @@
 //! Kyber protocol adapter for Skyber's synthetic media proofs.
 
+pub mod connectivity;
 pub mod transport;
 
 #[cfg(feature = "a1-native")]
