@@ -15,7 +15,7 @@ use zeroize::Zeroize;
 
 use crate::{
     Invitation, InvitationToken, PeerIdentity, RoomId, accept_message, invite_request_message,
-    resume_message,
+    relay_message, resume_message,
     server::{ClientMessage, ServerMessage, WireInvitationToken, WireSecretString},
 };
 
@@ -25,10 +25,108 @@ const MAX_CANDIDATE_LENGTH: usize = 1024;
 const MAX_UFRAG_LENGTH: usize = 32;
 const MIN_ICE_PASSWORD_LENGTH: usize = 22;
 const MAX_ICE_PASSWORD_LENGTH: usize = 256;
+const MAX_RELAY_DATAGRAM: usize = 1200;
 
 /// Typed signaling client over an already authenticated WebSocket connection.
 pub struct SignalClient<S> {
     websocket: S,
+}
+
+/// Authenticated WSS datagram tunnel for carrying opaque encrypted QUIC packets.
+pub struct RelayClient<S> {
+    websocket: S,
+    room: RoomId,
+}
+
+impl<S> RelayClient<S>
+where
+    S: Sink<Message, Error = WebSocketError>
+        + Stream<Item = Result<Message, WebSocketError>>
+        + Unpin,
+{
+    /// Join the room relay using the separate per-peer relay credential.
+    pub async fn join(
+        mut websocket: S,
+        room: RoomId,
+        relay_token: &InvitationToken,
+        signing_key: &SigningKey,
+    ) -> Result<Self, SignalClientError> {
+        let peer = PeerIdentity::from_signing_key(signing_key);
+        let signature = signing_key.sign(&relay_message(room, peer, relay_token.expose()));
+        let request = ClientMessage::RelayJoin {
+            room: *room.as_bytes(),
+            peer: *peer.as_bytes(),
+            token: WireInvitationToken(*relay_token.expose()),
+            signature: signature.to_bytes().to_vec(),
+        };
+        let text = serde_json::to_string(&request).map_err(SignalClientError::Json)?;
+        timeout(REQUEST_TIMEOUT, websocket.send(Message::Text(text.into())))
+            .await
+            .map_err(|_| SignalClientError::Timeout)?
+            .map_err(SignalClientError::WebSocket)?;
+
+        let ready = timeout(REQUEST_TIMEOUT, websocket.next())
+            .await
+            .map_err(|_| SignalClientError::Timeout)?
+            .ok_or(SignalClientError::Closed)?
+            .map_err(SignalClientError::WebSocket)?;
+        let Message::Text(ready) = ready else {
+            return Err(SignalClientError::UnexpectedFrame);
+        };
+        if ready.len() > MAX_WS_MESSAGE {
+            return Err(SignalClientError::InvalidFieldLength);
+        }
+        match serde_json::from_str::<ServerMessage>(&ready).map_err(SignalClientError::Json)? {
+            ServerMessage::RelayReady { room: ready_room } if ready_room == *room.as_bytes() => {
+                Ok(Self { websocket, room })
+            }
+            ServerMessage::Error { code } => Err(SignalClientError::Rejected(code)),
+            _ => Err(SignalClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Forward one bounded QUIC datagram while preserving its packet boundary.
+    pub async fn send_datagram(&mut self, datagram: &[u8]) -> Result<(), SignalClientError> {
+        if datagram.is_empty() || datagram.len() > MAX_RELAY_DATAGRAM {
+            return Err(SignalClientError::InvalidFieldLength);
+        }
+        timeout(
+            REQUEST_TIMEOUT,
+            self.websocket
+                .send(Message::Binary(datagram.to_vec().into())),
+        )
+        .await
+        .map_err(|_| SignalClientError::Timeout)?
+        .map_err(SignalClientError::WebSocket)
+    }
+
+    /// Receive one bounded QUIC datagram from the other authenticated peer.
+    pub async fn receive_datagram(&mut self) -> Result<Vec<u8>, SignalClientError> {
+        let frame = timeout(REQUEST_TIMEOUT, self.websocket.next())
+            .await
+            .map_err(|_| SignalClientError::Timeout)?
+            .ok_or(SignalClientError::Closed)?
+            .map_err(SignalClientError::WebSocket)?;
+        let Message::Binary(datagram) = frame else {
+            return Err(SignalClientError::UnexpectedFrame);
+        };
+        if datagram.is_empty() || datagram.len() > MAX_RELAY_DATAGRAM {
+            return Err(SignalClientError::InvalidFieldLength);
+        }
+        Ok(datagram.to_vec())
+    }
+
+    /// Close the relay tunnel and release the server's peer registration.
+    pub async fn close(&mut self) -> Result<(), SignalClientError> {
+        self.websocket
+            .close()
+            .await
+            .map_err(SignalClientError::WebSocket)
+    }
+
+    pub const fn room(&self) -> RoomId {
+        self.room
+    }
 }
 
 impl<S> SignalClient<S>
@@ -449,8 +547,28 @@ mod tests {
     use tokio_rustls::TlsConnector;
     use tokio_tungstenite::client_async;
 
-    use super::{SignalClient, SignalEvent};
+    use super::{RelayClient, SignalClient, SignalEvent};
     use crate::{PeerIdentity, server};
+
+    async fn websocket(
+        address: SocketAddr,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        path: &str,
+    ) -> anyhow::Result<
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    > {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate)?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(address).await?;
+        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned())?;
+        let tls = connector.connect(server_name, tcp).await?;
+        let (websocket, _) = client_async(format!("wss://localhost/{path}"), tls).await?;
+        Ok(websocket)
+    }
 
     async fn client(
         address: SocketAddr,
@@ -462,17 +580,9 @@ mod tests {
             >,
         >,
     > {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(certificate)?;
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(config));
-        let tcp = tokio::net::TcpStream::connect(address).await?;
-        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned())?;
-        let tls = connector.connect(server_name, tcp).await?;
-        let (websocket, _) = client_async("wss://localhost/signal", tls).await?;
-        Ok(SignalClient::from_authenticated_websocket(websocket))
+        Ok(SignalClient::from_authenticated_websocket(
+            websocket(address, certificate, "signal").await?,
+        ))
     }
 
     #[tokio::test]
@@ -496,7 +606,7 @@ mod tests {
         let invitation = inviter
             .create_invitation(invitee_identity, &inviter_key)
             .await?;
-        let mut invitee = client(address, certificate).await?;
+        let mut invitee = client(address, certificate.clone()).await?;
         let accepted = invitee
             .accept_invitation(
                 invitation.room,
@@ -511,10 +621,12 @@ mod tests {
             serde_json::to_string(accepted.credentials.resume_token().expose())?;
         assert!(!format!("{:?}", accepted.credentials).contains(&resume_token_json));
 
-        assert!(matches!(
-            timeout(Duration::from_secs(2), inviter.receive()).await??,
-            SignalEvent::InvitationAccepted(ack) if ack.remote_peer == invitee_identity
-        ));
+        let SignalEvent::InvitationAccepted(inviter_accepted) =
+            timeout(Duration::from_secs(2), inviter.receive()).await??
+        else {
+            anyhow::bail!("expected inviter acceptance event");
+        };
+        assert_eq!(inviter_accepted.remote_peer, invitee_identity);
         invitee
             .send_candidate(invitation.room, "candidate:synthetic-udp".to_owned())
             .await?;
@@ -544,6 +656,28 @@ mod tests {
         assert_eq!(ufrag.expose(), "local-ufrag");
         assert_eq!(password.expose(), "local-ice-password-with-22-chars");
         assert_eq!(format!("{ufrag:?}"), "[redacted]");
+
+        let mut inviter_relay = RelayClient::join(
+            websocket(address, certificate.clone(), "relay").await?,
+            invitation.room,
+            inviter_accepted.credentials.relay_token(),
+            &inviter_key,
+        )
+        .await?;
+        let mut invitee_relay = RelayClient::join(
+            websocket(address, certificate, "relay").await?,
+            invitation.room,
+            accepted.credentials.relay_token(),
+            &invitee_key,
+        )
+        .await?;
+        inviter_relay.send_datagram(&[1, 3, 5, 7]).await?;
+        assert_eq!(invitee_relay.receive_datagram().await?, [1, 3, 5, 7]);
+        invitee_relay.send_datagram(&[2, 4, 6]).await?;
+        assert_eq!(inviter_relay.receive_datagram().await?, [2, 4, 6]);
+        inviter_relay.close().await?;
+        invitee_relay.close().await?;
+
         invitee.hangup(invitation.room).await?;
         assert!(matches!(
             timeout(Duration::from_secs(2), inviter.receive()).await??,
