@@ -288,6 +288,8 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
             receive.stop();
             send.write_all(&[SHUTDOWN_ACK]).await?;
             send.flush().await?;
+            // The fixed-size application acknowledgment already confirms success;
+            // bound transport teardown and let endpoint close clean up if it lingers.
             let _transport_close = tokio::time::timeout(SHUTDOWN_TIMEOUT, raw.closed()).await;
             Ok::<(), anyhow::Error>(())
         })
