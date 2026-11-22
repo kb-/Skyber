@@ -328,6 +328,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quic_room_proof_from_previous_connection_cannot_be_replayed() -> anyhow::Result<()> {
+        let (peers, inviter, invitee, _) = fixture();
+
+        // A valid proof is bound to this connection's exporter. Retain a
+        // signature from one QUIC session and try to present it in another.
+        let (old_client, old_server) = quic_pair().await?;
+        let mut old_exporter = [0u8; 32];
+        old_client
+            .export_keying_material(&mut old_exporter, super::EXPORTER_LABEL, &[])
+            .map_err(|_| anyhow::anyhow!("could not export old QUIC keying material"))?;
+        let replayed_signature = inviter
+            .sign(&proof_message(0, peers, &old_exporter))
+            .to_bytes();
+        old_client.close(quinn::VarInt::from_u32(0), b"end replay fixture");
+        old_server.close(quinn::VarInt::from_u32(0), b"end replay fixture");
+
+        let (client, server) = quic_pair().await?;
+        let server_auth =
+            tokio::spawn(async move { authenticate_room(server, peers, &invitee).await });
+        let mut replay_stream = client.open_bi().await?;
+        replay_stream.0.write_all(&[super::VERSION, 0]).await?;
+        replay_stream.0.write_all(&replayed_signature).await?;
+        replay_stream.0.finish()?;
+
+        assert!(matches!(
+            server_auth.await?,
+            Err(RoomAuthError::InvalidProof)
+        ));
+        client.close(quinn::VarInt::from_u32(0), b"replay rejected");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn each_quic_reconnect_authenticates_a_new_connection() -> anyhow::Result<()> {
         let (peers, inviter, invitee, _) = fixture();
         for _ in 0..2 {
