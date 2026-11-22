@@ -822,8 +822,10 @@ mod tests {
         assert_eq!(inviter_reconnected.path(), NetworkPath::DirectUdp);
         assert_eq!(invitee_reconnected.path(), NetworkPath::DirectUdp);
 
+        let remote_connection = invitee_reconnected.quic_connection().clone();
         inviter.hangup_and_notify().await?;
         assert_eq!(invitee.next_event().await?, CallEvent::PeerHungUp);
+        timeout(Duration::from_secs(2), remote_connection.closed()).await?;
         invitee.hangup();
         server_task.abort();
         Ok(())
