@@ -1,11 +1,17 @@
 # Kyber media upstream comparison
 
-**Status:** Source audit in progress. Runtime capture, encode, transport, decode, presentation, synchronization and performance proofs remain open.
+**Status:** Pinned-source API audit complete for the capture, transport, playback and client/controller surfaces reviewed below. Runtime upstream capture, encode, transport, decode, presentation, synchronization and performance proofs remain open.
 **Reviewed:** 2026-11-22
 **SDK:** Kyber 0.29.0, SDK tag commit `ebca32a08f6488ea23750943ded52119efd584d6`.
 **Relevant component pins:** kymux `af10dbb3ea016135c0ec8e01143179ad4bda005b`, kymedia `b0efdfa251a19274ff1d9bf6324deb6bee10c026`, kyctl `92c632f9e889917a34aaa7697fb88b4991054b1c`, avconv `5ca80cca50573f212f2b20007b2642d4a7588a43`, VLC `d66cdddbfee408538a45e3e60d4f3b82a2f60b17`, vlc-rs `7cbfc51313b4bb3ab07be51505b7054e4e2c366b`, txproto `7f84b9e76bab936f57f1c184e65fb2118a020f06`.
 
 This comparison separates inspected source/API evidence from product documentation and from assumptions that require a runnable reference proof. The A1/A2 codecs and capture helpers remain useful comparison fixtures. They are not selected as the production media architecture. The production media gate stays closed until the pinned upstream comparison and audio and video reference proofs are complete.
+
+### Confirmed Windows source-selection gap (2026-11-22)
+
+The pinned `kymedia` source confirms the Windows webcam and physical-microphone gap. `kyavservice/src/avconv/video.rs` selects the `dxgi` grab provider and requests only `AVGRAB_SOURCE_TYPE_SCREEN` on Windows; `kyavservice-types::Command::KymuxStartVideo` selects a `display_id`, not a camera device. `kyavservice/src/avconv/audio.rs` selects the Windows `wasapi` provider but requests only `AVGRAB_SOURCE_TYPE_AUDIO_LOOPBACK`, then chooses a loopback source. Its `KymuxStartAudio` command has no source/device selector. The Linux video service has a configurable GStreamer source list, but the pinned audio service still selects loopback.
+
+These are SDK API limitations, not missing Windows devices: this host's webcam and microphone both captured and passed the existing local A1/A2 Kymux round-trip described below. The current upstream `kyavservice` commands cannot select those two physical Windows inputs. A production upstream-based proof therefore needs a supported source-injection/device-selection interface from Kyber or a narrowly scoped adapter that feeds Kyber's upstream encoding and Kymux path. It must not label the A1/A2 codec helpers as the production substitute. This inspection does not prove that no lower-level avconv C API can support such an adapter; that remains to be verified against the pinned libavconv public headers and runtime.
 
 ## Component comparison
 
