@@ -120,11 +120,12 @@ def video(track: str) -> int:
     finished = False
     error = None
     presented = 0
+    superseded = 0
     helper_start_ns = time.monotonic_ns()
     app = Gtk.Application()
 
     def read_frames() -> None:
-        nonlocal latest, finished, error
+        nonlocal latest, finished, error, superseded
         bus = pipeline.get_bus()
         try:
             if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
@@ -149,6 +150,8 @@ def video(track: str) -> int:
                 if converted.get_size() != WIDTH * HEIGHT * 4:
                     raise RuntimeError("unexpected RGBA stride")
                 with lock:
+                    if latest is not None:
+                        superseded += 1
                     latest = (converted.extract_dup(0, converted.get_size()), packet_id)
         except (OSError, RuntimeError) as failure:
             with lock:
@@ -216,6 +219,7 @@ def video(track: str) -> int:
         if finished and not presented:
             raise RuntimeError("video output presented no frames")
     print(f"Presented {presented} {track} frames", file=sys.stderr, flush=True)
+    print(f"SKYBER_VIDEO_SUPERSEDED {track} {superseded}", file=sys.stderr, flush=True)
     return status
 
 

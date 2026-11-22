@@ -74,6 +74,8 @@ struct Settings {
     capture: Option<DeviceCapture>,
     #[serde(default)]
     capture_wait_ms: u64,
+    #[serde(default)]
+    playback_drain_timeout_ms: u64,
     audio_output: Option<DeviceSelector>,
 }
 
@@ -456,6 +458,24 @@ fn parse_audio_drain_event(line: &str) -> Result<Option<AudioDrainEvent>> {
     }))
 }
 
+fn parse_video_superseded_event(line: &str, expected_track: &str) -> Result<Option<usize>> {
+    let Some(rest) = line.strip_prefix("SKYBER_VIDEO_SUPERSEDED ") else {
+        return Ok(None);
+    };
+    let mut fields = rest.split_ascii_whitespace();
+    let track = fields.next().context("missing video superseded track")?;
+    ensure!(track == expected_track, "video superseded track changed");
+    let count = fields
+        .next()
+        .context("missing video superseded frame count")?
+        .parse()?;
+    ensure!(
+        fields.next().is_none(),
+        "unexpected video superseded fields"
+    );
+    Ok(Some(count))
+}
+
 fn presentation_summary(
     events: &[PresentationEvent],
     decoded_frames: usize,
@@ -746,6 +766,8 @@ struct Observed {
     last_decoded_us: u64,
     timings: Vec<TimingSample>,
     presentation_events: Vec<PresentationEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presentation_superseded_frames: Option<usize>,
     audio_drain_events: Vec<AudioDrainEvent>,
     #[serde(skip_serializing_if = "presentation_summary_is_empty")]
     presentation_summary: PresentationSummary,
@@ -773,6 +795,7 @@ async fn present(
     Vec<TimingSample>,
     Vec<PresentationEvent>,
     Vec<AudioDrainEvent>,
+    Option<usize>,
 )> {
     use std::process::Stdio;
     use tokio::{
@@ -814,16 +837,23 @@ async fn present(
         let mut lines = BufReader::new(stderr).lines();
         let mut video_events = Vec::new();
         let mut audio_events = Vec::new();
+        let mut superseded_frames = None;
+        let expected_track = track.label();
         while let Some(line) = lines.next_line().await? {
             if let Some(event) = parse_video_presentation_event(&line)? {
                 video_events.push(event);
             } else if let Some(event) = parse_audio_drain_event(&line)? {
                 audio_events.push(event);
+            } else if let Some(count) = parse_video_superseded_event(&line, expected_track)? {
+                ensure!(
+                    superseded_frames.replace(count).is_none(),
+                    "duplicate video superseded event"
+                );
             } else {
                 eprintln!("{line}");
             }
         }
-        Ok::<_, anyhow::Error>((video_events, audio_events))
+        Ok::<_, anyhow::Error>((video_events, audio_events, superseded_frames))
     });
     let mut delivered = 0;
     let mut dismissed = false;
@@ -881,10 +911,16 @@ async fn present(
         ensure!(child.wait().await?.success(), "playback helper failed");
     }
     ensure!(delivered > 0 || dismissed, "playback had no decoded output");
-    let (presentation_events, audio_drain_events) = event_reader
+    let (presentation_events, audio_drain_events, superseded_frames) = event_reader
         .await
         .context("read presentation helper events")??;
-    Ok((delivered, timings, presentation_events, audio_drain_events))
+    Ok((
+        delivered,
+        timings,
+        presentation_events,
+        audio_drain_events,
+        superseded_frames,
+    ))
 }
 
 fn decode_track(
@@ -1019,15 +1055,25 @@ async fn subscribe(
         if playback {
             present(track, output, audio_output, origin).await
         } else {
-            Ok((0, Vec::new(), Vec::new(), Vec::new()))
+            Ok((0, Vec::new(), Vec::new(), Vec::new(), None))
         }
     };
     let decode = async { worker.await? };
-    let (_, (delivered, playback_timings, presentation_events, audio_drain_events), mut observed) =
-        tokio::try_join!(receive, render, decode)?;
+    let (
+        _,
+        (
+            delivered,
+            playback_timings,
+            presentation_events,
+            audio_drain_events,
+            presentation_superseded_frames,
+        ),
+        mut observed,
+    ) = tokio::try_join!(receive, render, decode)?;
     observed.playback_bytes = delivered;
     observed.presentation_events = presentation_events;
     observed.audio_drain_events = audio_drain_events;
+    observed.presentation_superseded_frames = presentation_superseded_frames;
     observed.presentation_summary = presentation_summary(
         &observed.presentation_events,
         observed.decoded_frames as usize,
@@ -1128,8 +1174,8 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
         .await
         .context("Kyber track registration timed out")??;
 
-        let drain_timeout = if playback {
-            PLAYBACK_DRAIN_TIMEOUT
+        let drain_timeout = if playback || config.playback_drain_timeout_ms > 0 {
+            Duration::from_millis(config.playback_drain_timeout_ms).max(PLAYBACK_DRAIN_TIMEOUT)
         } else {
             SETUP_TIMEOUT
         };
@@ -1232,8 +1278,8 @@ async fn main() -> Result<()> {
 mod timing_tests {
     use super::{
         PresentationEvent, TimingSample, TransportSample, packet_rate, parse_audio_drain_event,
-        parse_video_presentation_event, percentiles, presentation_summary, timing_summary,
-        transport_report,
+        parse_video_presentation_event, parse_video_superseded_event, percentiles,
+        presentation_summary, timing_summary, transport_report,
     };
 
     #[test]
@@ -1263,6 +1309,18 @@ mod timing_tests {
             "playback_helper_monotonic_us_since_start"
         );
         assert!(parse_audio_drain_event("SKYBER_AUDIO_DRAINED bad 10").is_err());
+    }
+
+    #[test]
+    fn parse_video_superseded_event_checks_track_identity() {
+        assert_eq!(
+            parse_video_superseded_event("SKYBER_VIDEO_SUPERSEDED camera 3", "camera")
+                .expect("valid event"),
+            Some(3)
+        );
+        assert!(
+            parse_video_superseded_event("SKYBER_VIDEO_SUPERSEDED screen 3", "camera").is_err()
+        );
     }
 
     #[test]

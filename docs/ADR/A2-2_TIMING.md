@@ -31,6 +31,7 @@ The current boundaries are:
 | `playback_submit_start_us`, `playback_submit_end_us` | Rust's write of decoded bytes to the platform helper pipe. This is not display scanout or speaker completion. |
 | `presentation_events` | For each Windows `WM_PAINT` or GTK `after-paint` event, the video helper reports the decoded packet ID and a helper-local monotonic timestamp. This is a window/compositor paint boundary, not physical display scanout. |
 | `presentation_summary.decoded_frames_without_paint_event` | Decoded frame count minus correlated paint-event count. This is a presentation shortfall indicator, not a scanout or network-loss count. |
+| `presentation_superseded_frames` | Video helper count of decoded frames overwritten in its presentation slot before a paint. |
 | `audio_drain_events` | One helper-local event after all decoded PCM sample frames have completed the Windows `waveOut` buffer queue or the Ubuntu GStreamer sink has posted EOS after drain. The count must equal the decoded sample-frame total. This is not acoustic output or per-packet speaker latency. |
 
 Video results also summarize event count, helper-local presentation rate,
@@ -97,16 +98,17 @@ The 12-second synthetic playback case passed on Windows and Ubuntu
 26.04.1. Every reported paint event referenced a decoded packet ID, and
 each helper-local clock increased.
 
-| Platform | Track | Decoded frames | Paint events | No paint event | Paint rate | Inter-event p50/p95 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Windows GDI | Camera | 180 | 180 | 0 | 15.12 fps | 62,852 / 79,082 µs |
-| Windows GDI | Screen | 105 | 105 | 0 | 15.19 fps | 63,021 / 78,640 µs |
-| Ubuntu GTK | Camera | 180 | 162 | 18 | 15.17 fps | 66,909 / 72,419 µs |
-| Ubuntu GTK | Screen | 105 | 89 | 16 | 15.25 fps | 67,032 / 82,810 µs |
+| Platform | Track | Decoded | Painted | Superseded | No paint event | Paint rate | Inter-event p50/p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Windows GDI | Camera | 180 | 180 | 0 | 0 | 15.06 fps | 65,580 / 78,059 µs |
+| Windows GDI | Screen | 105 | 105 | 0 | 0 | 15.12 fps | 63,339 / 78,233 µs |
+| Ubuntu GTK | Camera | 180 | 161 | 18 | 19 | 15.07 fps | 66,950 / 71,411 µs |
+| Ubuntu GTK | Screen | 105 | 87 | 17 | 18 | 15.10 fps | 66,895 / 71,839 µs |
 
 The GTK viewer uses a latest-frame slot, so superseded frames can be
-decoded without being painted. The no-paint counts report that shortfall;
-they do not identify every internal cause. These events end at the native
+decoded without being painted. Superseded counts identify frames replaced
+in that slot; the no-paint count can be larger when another frame has no
+paint callback before shutdown. These events end at the native
 window/compositor paint boundary, not display scanout. The latest checked
 results are under `target/a2-2/presentation-shortfall-windows/` and on the
 Ubuntu guest at `target/a2-2/presentation-shortfall-ubuntu/`.
@@ -147,9 +149,9 @@ and the Ubuntu guest's
 
 One full Windows playback run exceeded the peer's original four-second
 post-media shutdown margin. The identical-duration direct run and one
-complete wrapper retry passed. The playback test peer now allows a
-12-second drain margin for output helpers; it still times out if the
-helpers or tracks fail to terminate within that bound.
+complete wrapper retry passed. Playback tests now give both peers a
+12-second post-media drain margin; they still time out if tracks or output
+helpers fail to terminate within that bound.
 
 ### Helper timestamp protocol check
 

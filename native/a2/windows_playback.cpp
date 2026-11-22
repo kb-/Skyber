@@ -99,6 +99,7 @@ int play_audio(HANDLE input, UINT device) {
 struct Viewer {
     std::array<std::uint8_t, width * height * 4> image{};
     unsigned rendered = 0;
+    unsigned superseded = 0;
     std::uint64_t packet_id = 0;
     bool awaiting_paint = false;
     std::chrono::steady_clock::time_point helper_start = std::chrono::steady_clock::now();
@@ -110,6 +111,7 @@ std::uint8_t channel(int component) {
 
 void update(Viewer &viewer, const std::array<std::uint8_t, i420_size> &frame,
             std::uint64_t packet_id) {
+    if (viewer.awaiting_paint) ++viewer.superseded;
     for (int row = 0; row < height; ++row) {
         for (int col = 0; col < width; ++col) {
             const int pixel = row * width + col;
@@ -238,6 +240,8 @@ int play_video(HANDLE input, bool screen) {
     }
     std::cerr << "Presented " << viewer.rendered << " "
               << (screen ? "screen" : "camera") << " frames\n";
+    std::cerr << "SKYBER_VIDEO_SUPERSEDED " << (screen ? "screen" : "camera")
+              << " " << viewer.superseded << '\n';
     return 0;
 }
 }  // namespace

@@ -385,6 +385,7 @@ def run_case(
                 "direction": direction,
                 "duration_ms": duration,
                 "screen_stop_ms": screen_stop,
+                "playback_drain_timeout_ms": 12000 if playback else 0,
             }
             play = playback and role == "initiator"
             if play and audio_output is not None:
@@ -418,7 +419,9 @@ def run_case(
         if failure == "hangup":
             await_marker(listener / "microphone.receiving", peers["listener"], time.monotonic() + 6)
             stop_process(peers["initiator"])
-        resources = monitor_processes(peers, 85 if capture is not None else 20)
+        resources = monitor_processes(
+            peers, 85 if capture is not None else 35 if playback else 20
+        )
         (output / "resource-samples.json").write_text(json.dumps({
             "clock_domain": "test_runner_monotonic_us_since_launch",
             "processes": resources,
@@ -472,9 +475,13 @@ def run_case(
                                 for left, right in zip(events, events[1:])),
                             f"{track} presentation clock is not increasing")
                     summary = row.get("presentation_summary", {})
+                    superseded = row.get("presentation_superseded_frames")
                     require(summary.get("presented_frames") == len(events)
                             and summary.get("decoded_frames_without_paint_event")
                                 == max(0, row["decoded_frames"] - len(events))
+                            and isinstance(superseded, int)
+                            and 0 <= superseded
+                                <= summary["decoded_frames_without_paint_event"]
                             and summary.get("clock_domain") == "playback_helper_monotonic_us_since_start"
                             and summary.get("inter_event_interval_us", {}).get("samples")
                                 == max(0, len(events) - 1),
