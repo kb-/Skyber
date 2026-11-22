@@ -270,6 +270,9 @@ mod tests {
 
     use super::{IceQuinnSocket, MAX_PACKET_SIZE, PACKET_CAPACITY};
     use crate::room_auth::authenticate_room;
+    use crate::transport::{
+        AudioMode, Role, TrackProtocols, VideoMode, register_tracks_with_protocols,
+    };
     use ed25519_dalek::SigningKey;
     use skyber_signaling::{AuthenticatedPeers, PeerIdentity, RoomId};
     use std::{io::IoSliceMut, task::Poll};
@@ -381,6 +384,48 @@ mod tests {
             &acknowledgement == b"ack",
             "Kyber response was not received"
         );
+
+        let (client_media, server_media) = tokio::try_join!(
+            kymux::kyproto::Connection::connect(client.clone()),
+            kymux::kyproto::Connection::accept(server.clone()),
+        )?;
+        let client_protocols = TrackProtocols {
+            microphone: AudioMode::UnreliableFec,
+            camera: VideoMode::GopStream,
+            screen: VideoMode::Reliable,
+        };
+        let server_protocols = TrackProtocols {
+            microphone: AudioMode::Unreliable,
+            camera: VideoMode::UnreliableFec,
+            screen: VideoMode::GopStream,
+        };
+        let (client_tracks, server_tracks) = tokio::try_join!(
+            register_tracks_with_protocols(
+                &client_media,
+                Role::Initiator,
+                &[skyber_core::Track::Microphone],
+                &[skyber_core::Track::Camera],
+                client_protocols,
+            ),
+            register_tracks_with_protocols(
+                &server_media,
+                Role::Listener,
+                &[skyber_core::Track::Camera],
+                &[skyber_core::Track::Microphone],
+                server_protocols,
+            ),
+        )?;
+        ensure!(
+            client_tracks.effective_protocols().microphone == Some(AudioMode::UnreliableFec)
+                && server_tracks.effective_protocols().camera == Some(VideoMode::UnreliableFec),
+            "negotiated media protocols did not match the peer selections"
+        );
+        let mut client_tracks = client_tracks;
+        let mut server_tracks = server_tracks;
+        tokio::try_join!(
+            client_tracks.finish(Role::Initiator),
+            server_tracks.finish(Role::Listener),
+        )?;
 
         client.close(0, "transport proof complete");
         server.close(0, "transport proof complete");
