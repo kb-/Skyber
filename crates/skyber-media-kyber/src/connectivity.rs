@@ -307,7 +307,8 @@ pub async fn accept_probe_once(server: &impl Server, token: &[u8; 32]) -> Result
             wait_for_transport_close(raw.closed(), SHUTDOWN_TIMEOUT).await;
             Ok(())
         }
-        Ok(Err(error)) | Err(error) => Err(error),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(error).context("Gate C-0 listener timed out waiting for one probe"),
     };
     server.close(0, "Gate C-0 probe complete");
     completed
