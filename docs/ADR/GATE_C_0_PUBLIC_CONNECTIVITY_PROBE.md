@@ -1,8 +1,8 @@
 # Gate C-0 — authenticated direct connectivity probe
 
 **Status:** Probe implemented; Ubuntu IPv4/IPv6 and Windows IPv4 loopback
-authentication checks pass. Windows IPv6 listener bind and any direct Internet
-path remain unverified.
+authentication checks pass. A direct IPv4 exchange from Windows over 4G to the
+Ubuntu home lab also passes. Windows IPv6 listener binding remains unverified.
 **Kyber revision:** `kymux` `af10dbb3ea016135c0ec8e01143179ad4bda005b`.
 
 ## Scope and security boundary
@@ -98,6 +98,14 @@ with the repository-pinned Rust 1.96.0 toolchain. Unit tests reject malformed
 fixed-size messages, invalid padding, bad pins, truncated frames, stalled
 reads, and non-loopback addresses without `--internet`.
 
+On 2026-11-22, the Windows client completed an authenticated synthetic exchange
+with the Ubuntu listener through the home router's public IPv4 endpoint while
+Windows used the 4G hotspot. The Ubuntu listener log reported completion. No
+media data was sent. The client returned exit code 0. The router forward and
+source-limited host firewall allowance for UDP 34780 are retained for repeat
+Gate C-0 runs. The 4G source address may need updating if the carrier changes
+it.
+
 The IPv6 loopback case could not start the pinned Kyber `CommonServer` on this
 Windows host: endpoint creation returned Windows socket error 10022 for an
 `[::1]` bind. Ubuntu passed the same test. The Windows host has an IPv6
@@ -106,8 +114,7 @@ Do not replace the specific bind with `[::]` for a loopback test; that would
 listen on every IPv6 interface. Investigate a narrow upstream-compatible
 Windows IPv6 bind path before claiming Windows IPv6 support.
 
-No public Internet, router-forward, firewall, 4G, NAT, or production-media
-test has been run from this implementation. Gate C-0 remains open until
-Windows IPv6 is resolved and the source-scoped direct Internet procedure is
-recorded on the intended endpoints. Gate C-1 discovery, NAT traversal, and
-relay work remain separate.
+The direct IPv4 exchange validates authenticated public connectivity for this
+endpoint pair. It does not test NAT traversal, relay behavior, IPv6, or
+production media. Gate C-0 remains open until Windows IPv6 is resolved.
+Gate C-1 discovery, NAT traversal, and relay work remain separate.

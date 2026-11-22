@@ -142,9 +142,11 @@ Kyber media decoder or uses the peer-sized `DataPacket` parser.
 
 Prove IPv4 and IPv6 loopback first, then direct public IPv4 and IPv6 where
 available. Record whether the path succeeds through the home router's
-temporary source-scoped UDP forward and host firewall rule. Remove temporary
-network rules after the test. Do not interpret this synthetic exchange as a
-media, NAT-traversal, relay, or production identity proof. See
+source-scoped UDP forward and host firewall rule. Keep the narrow rules while
+Gate C-0 direct-connectivity testing remains active, refresh the allowed source
+if the mobile address changes, and remove the rules when that testing ends. Do
+not interpret this synthetic exchange as a media, NAT-traversal, relay, or
+production identity proof. See
 [Gate C-0 probe design and results](ADR/GATE_C_0_PUBLIC_CONNECTIVITY_PROBE.md).
 
 #### Gate C-1 — path discovery and fallback
