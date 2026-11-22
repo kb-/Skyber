@@ -48,37 +48,41 @@ pub async fn listen_lan(
     address: LanAddress,
     certificate: &Path,
     key: &Path,
+    keep_alive: bool,
 ) -> Result<kynet::common::CommonServer> {
-    listen_at(address.0, certificate, key).await
+    listen_at(address.0, certificate, key, keep_alive).await
 }
 
 pub async fn connect_lan(
     address: LanAddress,
     fingerprint: String,
     secret: &str,
+    keep_alive: bool,
 ) -> Result<kyproto::Connection> {
-    connect_to(address.0, fingerprint, secret).await
+    connect_to(address.0, fingerprint, secret, keep_alive).await
 }
 
 pub async fn listen(
     address: SocketAddr,
     certificate: &Path,
     key: &Path,
+    keep_alive: bool,
 ) -> Result<kynet::common::CommonServer> {
     ensure!(address.ip().is_loopback(), "A1 listener requires loopback");
-    listen_at(address, certificate, key).await
+    listen_at(address, certificate, key, keep_alive).await
 }
 
 async fn listen_at(
     address: SocketAddr,
     certificate: &Path,
     key: &Path,
+    keep_alive: bool,
 ) -> Result<kynet::common::CommonServer> {
     let cert = kynet::cert::load_cert_from_pem_file(certificate).await?;
     let key = kynet::cert::load_private_key_from_pem_file(key).await?;
     let options = kynet::common::CommonServerOptions {
         max_idle_timeout: Some(Duration::from_secs(10)),
-        keep_alive_interval: None,
+        keep_alive_interval: keep_alive.then_some(Duration::from_secs(2)),
     };
     Ok(kynet::Connection::start_server_on_addr(
         address,
@@ -102,19 +106,21 @@ pub async fn connect(
     address: SocketAddr,
     fingerprint: String,
     secret: &str,
+    keep_alive: bool,
 ) -> Result<kyproto::Connection> {
     ensure!(address.ip().is_loopback(), "A1 connector requires loopback");
-    connect_to(address, fingerprint, secret).await
+    connect_to(address, fingerprint, secret, keep_alive).await
 }
 
 async fn connect_to(
     address: SocketAddr,
     fingerprint: String,
     secret: &str,
+    keep_alive: bool,
 ) -> Result<kyproto::Connection> {
     let options = kynet::quinn::QuinnClientOptions {
         max_idle_timeout: Some(Duration::from_secs(10)),
-        keep_alive_interval: None,
+        keep_alive_interval: keep_alive.then_some(Duration::from_secs(2)),
         certificate_hash: Some(fingerprint),
     };
     let raw = kynet::Connection::quinn_connect(address, "localhost", None, &options).await?;

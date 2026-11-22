@@ -54,13 +54,13 @@ Build and stage the Kyber peer in the same directory as the helper:
 
 ~~~powershell
 wsl.exe --distribution Ubuntu -- bash -lc 'bash scripts/build-a1-peer.sh ~/.cache/skyber-a1-0.29.0 target/a2-1a'
-py -3 scripts/test-a2-1a.py target/a2-1a/skyber-a1-peer.exe --camera 0 --microphone 0
+py -3 scripts/test-a2-capture.py target/a2-1a/skyber-a1-peer.exe --camera 0 --microphone 0
 $window = Start-Process target/a2-1a/skyber-windows-capture.exe -ArgumentList '--test-window' -PassThru
 $env:SKYBER_EXPECTED_SCREEN_TITLE = 'SKYBER TEST'
-py -3 scripts/test-a2-1a.py target/a2-1a/skyber-a1-peer.exe --camera 0 --microphone 0 --with-screen
+py -3 scripts/test-a2-capture.py target/a2-1a/skyber-a1-peer.exe --camera 0 --microphone 0 --with-screen
 Remove-Item Env:SKYBER_EXPECTED_SCREEN_TITLE
 $window.CloseMainWindow()
-py -3 scripts/test-a2-1a.py target/a2-1a/skyber-a1-peer.exe --camera 0 --microphone 0 --cancel-screen
+py -3 scripts/test-a2-capture.py target/a2-1a/skyber-a1-peer.exe --camera 0 --microphone 0 --cancel-screen
 ~~~
 
 Use the indexes returned by the probe. With screen enabled, select a
