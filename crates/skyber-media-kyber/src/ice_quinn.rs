@@ -355,6 +355,14 @@ impl RelayQuinnSocket {
     pub fn close(&self) {
         self.shutdown.send_replace(true);
     }
+
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub const fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
 }
 
 impl Drop for RelayQuinnSocket {
@@ -648,7 +656,7 @@ mod tests {
     async fn websocket_roundtrip(drop_first_packet_each_way: bool) -> Result<()> {
         let (client_socket, server_socket, relay) =
             websocket_pair(drop_first_packet_each_way).await?;
-        let server_addr = server_socket.local_addr()?;
+        let server_addr = server_socket.local_addr();
 
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
         let certificate = certified.cert.der().clone();

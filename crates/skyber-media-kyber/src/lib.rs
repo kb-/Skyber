@@ -5,6 +5,7 @@ pub mod connectivity;
 pub mod ice_quinn;
 pub mod ice_session;
 pub mod path_policy;
+pub mod quinn_connector;
 pub mod room_auth;
 pub mod transport;
 

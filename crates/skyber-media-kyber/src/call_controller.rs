@@ -32,6 +32,9 @@ pub trait CallPathConnector {
         Self: 'a;
 
     fn connect(&mut self, path: NetworkPath) -> Self::ConnectFuture<'_>;
+
+    /// Release endpoint/socket resources associated with a successful path.
+    fn close(&mut self) {}
 }
 
 /// Owns one call's direct-first authenticated QUIC path and bounded recovery.
@@ -87,11 +90,13 @@ impl<C: CallPathConnector> CallController<C> {
                     if let Some(next_attempt) = next {
                         attempt = next_attempt;
                     } else {
+                        self.connector.close();
                         return Err(CallControllerError::AttemptsExhausted { path, reason });
                     }
                 }
                 Err(error) => {
                     self.policy.close();
+                    self.connector.close();
                     return Err(error);
                 }
             }
@@ -106,6 +111,7 @@ impl<C: CallPathConnector> CallController<C> {
     ) -> Result<&ConnectedCall, CallControllerError> {
         let current = self.active.take().ok_or(CallControllerError::Closed)?;
         current.close("call path lost");
+        self.connector.close();
         let Some(attempt) = self.policy.connection_lost()? else {
             return Err(CallControllerError::RecoveryExhausted);
         };
@@ -118,6 +124,7 @@ impl<C: CallPathConnector> CallController<C> {
             Err(error) => {
                 self.policy.failed(attempt)?;
                 self.policy.close();
+                self.connector.close();
                 Err(error)
             }
         }
@@ -128,6 +135,7 @@ impl<C: CallPathConnector> CallController<C> {
         if let Some(call) = self.active.take() {
             call.close("call ended");
         }
+        self.connector.close();
         self.policy.close();
     }
 
