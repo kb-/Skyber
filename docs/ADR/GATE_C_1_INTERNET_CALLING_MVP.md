@@ -12,7 +12,7 @@
 - Invitations are short-lived, single-use, bound to the intended peer identity and room, and separate from a narrowly scoped reconnect credential. Authenticate both peer identities and bind the room and invitation to the authenticated session. Never log credentials.
 - The service operator credential administers the service. It is not required for ordinary users to create invitations. Room creation and invitation acceptance need separate authorization and rate limits.
 - The Ubuntu home lab may host signaling and relay on public TCP 443. The current code does not provide a public STUN/TURN service or use UDP 3478; direct Internet ICE gathering and NAT traversal remain unproven. Calling participants do not need inbound port forwards or a VPN for the WSS relay path.
-- Complete bounded decoding of peer-controlled Kyber data-packet lengths before enabling Internet media. The two readers identified in the SDK audit currently allocate from an untrusted length.
+- Record the known upstream Kyber/Kymux receive-path allocation risk as an unresolved third-party dependency; Skyber will not fork or patch Kymux for C-1. Continue transport, signaling, Qt, identity-binding, and synthetic-media work. Do not describe the unmodified receive path as safe for arbitrary Internet peers. Share technical vulnerability details with the upstream maintainers through a private report rather than adding a public proof of concept.
 
 ## Implementation sequence
 
@@ -38,7 +38,7 @@ The `path_policy` module now defines tested call setup order (direct UDP, then W
 
 ### C-1d — Desktop call and protected media
 
-Add Qt call controls and video presentation. Harden the pinned Kyber packet readers before making media reachable from the Internet. Keep business logic in Rust/core and the Qt bridge; QML remains presentation-focused.
+Add Qt call controls and video presentation. Keep business logic in Rust/core and the Qt bridge; QML remains presentation-focused. Integrate the authenticated room-to-QUIC session binding before activating Kyber media endpoints. Use synthetic media for repeatable Internet transport tests. Live-media trials with the unmodified upstream parser, if undertaken, require an explicitly authorized, isolated test between known participants, documented risk acceptance, and bounded process resources; authentication and resource limits reduce exposure but do not fix the underlying allocation risk. No unattended public-beta or arbitrary-peer Internet media exposure should be presented as safe while the upstream issue remains unresolved.
 
 ### C-1e — Acceptance
 
@@ -54,6 +54,40 @@ Measure call setup, relay throughput, p95 latency, audio continuity, video prese
 
 Gate C-1 completion means a usable IPv4 Internet calling MVP with direct/relay selection and documented limitations. Full Gate C additionally requires IPv6 and the broader supported-topology requirements in `PLAN_SKYBER.md`, or an explicit scope change.
 
+## Upstream media-parser risk decision (2026-11-22)
+
+**Status:** Known, unresolved third-party security dependency; private upstream report pending.
+
+**Owner of a parser fix:** Kyber/Kymux maintainers.
+
+**Skyber decision:** Document and track; do not introduce or maintain an application-specific Kymux patch as part of Gate C-1.
+
+The pinned Kymux receive path is reported by source review to allocate memory based on peer-controlled packet lengths before Skyber can impose application-level limits. A malicious or defective authenticated participant could therefore cause excessive allocation or denial of service.
+
+Neither signaling authorization, a TLS/QUIC connection, WebSocket datagram-size limits, nor checks after packet decoding constitute a fix.
+
+This ADR intentionally omits source-level triggering details and any exploit reproduction steps; these belong in a private coordinated disclosure to the maintainers.
+
+**Development may continue:** Complete pre-media, two-sided room-identity authentication bound to the QUIC session; direct/relay transport; reconnect, signaling, call lifecycle, synthetic-media validation, and Qt integration.
+
+Do not gate these independent workstreams on an upstream patch. Keep all media activation behind an explicit policy decision rather than accidentally exposing Kyber's unmodified parser through the new public call path.
+
+**Exposure policy:** Synthetic/raw-Quinn transport tests may use the public lab endpoint, but Internet-connected Kyber media with arbitrary or unvetted peers is not approved.
+
+If an engineer intentionally runs a closed live-media experiment with a known, cooperating peer, document the participants, scope, process isolation/resource limits, operator acceptance of the residual denial-of-service risk, and teardown; do not treat that experiment as evidence of production safety.
+
+Peer authentication reduces who can reach the parser; it does not remove the defect.
+
+**Dependency follow-up:** Privately notify the Kyber maintainers through an appropriate security-reporting channel with the pinned revision, affected receive paths, impact assessment and a minimal non-destructive reproduction if one is established.
+
+Track acknowledgement, advisory/fix status and the updated safe upstream pin before revisiting unrestricted Internet-media exposure.
+
+No vulnerability fix, exploitability proof or vendor notification is claimed by this ADR.
+
+**Acceptance consequence:** Gate C-1 transport, signaling and desktop integration can progress and be demonstrated with synthetic traffic.
+
+Do not mark general-public live-media readiness as fully accepted while this risk remains open; record any narrowly controlled trial and the explicit limitation in release documentation.
+
 ## C-1a evidence
 
 The test `ice_quinn::tests::nominated_ice_pair_carries_pinned_kyber_quic` creates two local ICE agents, exchanges host candidates, nominates a loopback pair, wraps each selected ICE connection as Quinn's UDP socket, and exchanges data over a pinned Kyber bidirectional stream.
@@ -62,4 +96,4 @@ The test `ice_quinn::tests::websocket_relay_carries_pinned_kyber_quic` carries a
 
 The proof uses `webrtc-ice` 0.17.3 (MIT/Apache-2.0), Quinn 0.11.12 and Kyber/Kymux revision `af10dbb3ea016135c0ec8e01143179ad4bda005b`. Quinn's public abstract UDP socket API and Kyber's public `From<quinn::Connection>` conversion are sufficient; no Kyber fork is needed. The `skyber-signaling` server also has local WSS tests for authenticated room signaling and bidirectional relay datagrams.
 
-These are local proofs. They do not establish public STUN/TURN, WSS deployment on TCP 443, Internet NAT behavior, sustained relay performance, desktop path integration, identity binding to the QUIC transcript, hardened Kyber packet decoding, active-call track restoration, or live media quality. The relay transport test's injected delay/drop checks QUIC recovery and bounded adapter behavior; it is not a performance result. The pinned Kyber/Kymux revision still contains two media readers that allocate from peer-controlled lengths; Internet-facing media must remain disabled until that parser risk is fixed and regression-tested.
+These are local proofs. They do not establish public STUN/TURN, WSS deployment on TCP 443, Internet NAT behavior, sustained relay performance, desktop path integration, identity binding to the QUIC transcript, hardened Kyber packet decoding, active-call track restoration, or live media quality. The relay transport test's injected delay/drop checks QUIC recovery and bounded adapter behavior; it is not a performance result. The unresolved upstream parser risk remains subject to the documented media-exposure restrictions and private vendor disclosure plan above.
