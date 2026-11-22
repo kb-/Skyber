@@ -5,11 +5,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $context = 'desktop-linux'
-$image = 'registry.gitlab.com/kyber/ops/docker-images/debian-win64@sha256:39632e7b0283d5686cfae181b0c85d17b68e3a3024d4054c5eae64b80d8c9694'
 $volume = 'skyber-c1-windows-cache'
 $container = 'skyber-c1-windows-builder'
 $imageTag = 'skyber-kyber-win64:ebca32a08f6488ea'
-$sdkRevision = 'ebca32a08f6488ea23750943ded52119efd584d6'
 
 function Invoke-Docker {
     param([string[]] $DockerArgs)
@@ -51,8 +49,8 @@ if ($Status) {
 }
 
 foreach ($candidate in @($container, 'skyber-c1-windows-build')) {
-    & docker inspect $candidate 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { continue }
+    $candidateId = & docker ps --all --quiet --filter "name=^/$candidate$"
+    if (-not $candidateId) { continue }
     $candidateState = (& docker inspect $candidate --format '{{.State.Status}}').Trim()
     if ($candidateState -ne 'running') { continue }
     $runningBuild = & docker exec $candidate bash -lc "pgrep -af 'build-win32.sh|meson compile|cargo (build|cinstall)' | grep -v grep" 2>$null
@@ -61,24 +59,18 @@ foreach ($candidate in @($container, 'skyber-c1-windows-build')) {
     }
 }
 
-$imageExists = & docker image inspect $imageTag 2>$null
-if ($LASTEXITCODE -ne 0) {
-    $dockerfile = @"
-FROM $image
-RUN uv tool install --python /usr/bin/python3 --with 'jinja2==3.1.6' --with 'markupsafe==3.0.3' 'meson==1.12.1'
-ENV PATH="/root/.local/bin:/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV CARGO_HOME=/tmp/cargo
-ENV MESON_PACKAGE_CACHE_DIR=/tmp/meson-packagecache
-"@
-    $dockerfile | & docker build --tag $imageTag --file - -
+$imageExists = & docker image ls --quiet $imageTag
+if (-not $imageExists) {
+    $dockerfile = Join-Path $PSScriptRoot 'kyber-windows-toolchain.Dockerfile'
+    & docker build --tag $imageTag --file $dockerfile $PSScriptRoot
     if ($LASTEXITCODE -ne 0) { throw 'Could not build the pinned Kyber toolchain image.' }
 }
 
-& docker volume inspect $volume 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) { Invoke-Docker @('volume', 'create', $volume) | Out-Null }
+$existingVolume = & docker volume ls --quiet --filter "name=^$volume$"
+if (-not $existingVolume) { Invoke-Docker @('volume', 'create', $volume) | Out-Null }
 
-$containerExists = & docker inspect $container 2>$null
-if ($LASTEXITCODE -ne 0) {
+$existingContainer = & docker ps --all --quiet --filter "name=^/$container$"
+if (-not $existingContainer) {
     Invoke-Docker @('run', '--detach', '--name', $container, '--volume', "${volume}:/tmp", $imageTag, 'sleep', 'infinity') | Out-Null
 } else {
     $existingImage = (& docker inspect $container --format '{{.Config.Image}}').Trim()
@@ -101,14 +93,24 @@ mkdir -p "$MESON_PACKAGE_CACHE_DIR" "$CARGO_HOME"
 if [ ! -d "$sdk/.git" ]; then
   git clone --recurse-submodules https://gitlab.com/kyber/core/kysdk.git "$sdk"
 fi
-git -C "$sdk" fetch --tags --recurse-submodules
-git -C "$sdk" checkout --detach ebca32a08f6488ea23750943ded52119efd584d6
+if ! git -C "$sdk" cat-file -e ebca32a08f6488ea23750943ded52119efd584d6^{commit} 2>/dev/null; then
+  git -C "$sdk" fetch --tags --recurse-submodules
+fi
+if [ "$(git -C "$sdk" rev-parse HEAD)" != ebca32a08f6488ea23750943ded52119efd584d6 ]; then
+  git -C "$sdk" checkout --detach ebca32a08f6488ea23750943ded52119efd584d6
+fi
 git -C "$sdk" submodule update --init --recursive
 test "$(git -C "$sdk" rev-parse HEAD)" = ebca32a08f6488ea23750943ded52119efd584d6
 
 cd "$sdk/kyctl"
-./build-win32.sh -d -o "$rootfs"
-./build-win32.sh -s -o "$rootfs" build-kyclient
+if [ ! -f "$rootfs/bin/kyavserver.exe" ] || \
+   [ ! -f "$rootfs/bin/kynputserver.exe" ] || \
+   [ ! -f "$rootfs/lib/libavcodec.a" ]; then
+  ./build-win32.sh -d -o "$rootfs"
+fi
+if [ ! -f "$rootfs/lib/libkyclient.a" ] || [ ! -f "$rootfs/bin/kyclient.dll" ]; then
+  ./build-win32.sh -s -o "$rootfs" build-kyclient
+fi
 test -f "$rootfs/lib/libkyclient.a"
 find "$rootfs" -maxdepth 3 -type f -print | sort > /tmp/skyber-kyber-windows-artifacts.txt
 '@
