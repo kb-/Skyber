@@ -7,6 +7,7 @@ license.workspace = true
 
 [features]
 a1-native = ["tokio/process", "tokio/io-util"]
+upstream-vlc-player = ["dep:kyvlcplayer", "dep:log", "kymux/ipc"]
 
 [dependencies]
 anyhow.workspace = true
@@ -15,6 +16,8 @@ ed25519-dalek.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 kymux.workspace = true
+kyvlcplayer = { git = "https://gitlab.com/kyber/core/kyctl.git", rev = "92c632f9e889917a34aaa7697fb88b4991054b1c", package = "kyvlcplayer", optional = true }
+log = { workspace = true, optional = true }
 quinn.workspace = true
 rustls.workspace = true
 serde.workspace = true
@@ -42,3 +45,6 @@ required-features = ["a1-native"]
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }

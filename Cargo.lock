@@ -1045,10 +1045,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kycom"
+version = "0.1.0"
+source = "git+https://gitlab.com/kyber/core/kymux.git?rev=af10dbb3ea016135c0ec8e01143179ad4bda005b#af10dbb3ea016135c0ec8e01143179ad4bda005b"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "kymux-types",
+ "log",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "kymux"
 version = "0.1.0"
 source = "git+https://gitlab.com/kyber/core/kymux.git?rev=af10dbb3ea016135c0ec8e01143179ad4bda005b#af10dbb3ea016135c0ec8e01143179ad4bda005b"
 dependencies = [
+ "kycom",
  "kymux-types",
  "kynet",
  "kyproto",
@@ -1125,6 +1139,19 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "windows",
+]
+
+[[package]]
+name = "kyvlcplayer"
+version = "0.1.0"
+source = "git+https://gitlab.com/kyber/core/kyctl.git?rev=92c632f9e889917a34aaa7697fb88b4991054b1c#92c632f9e889917a34aaa7697fb88b4991054b1c"
+dependencies = [
+ "libc",
+ "log",
+ "raw-window-handle",
+ "thiserror 2.0.21",
+ "tokio",
+ "vlc-rs",
 ]
 
 [[package]]
@@ -1387,6 +1414,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
 name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1620,6 +1653,12 @@ name = "raptorq"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cc8cd0bcb2d520fff368264b5a6295e064c60955349517d09b14473afae4856"
+
+[[package]]
+name = "raw-window-handle"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2ff9a1f06a88b01621b7ae906ef0211290d1c8a168a15542486a8f61c0833b9"
 
 [[package]]
 name = "rcgen"
@@ -2011,6 +2050,8 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "kymux",
+ "kyvlcplayer",
+ "log",
  "quinn",
  "rcgen",
  "rustls",
@@ -2025,6 +2066,7 @@ dependencies = [
  "tokio-tungstenite",
  "webrtc-ice",
  "webrtc-util",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -2508,6 +2550,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vlc-rs"
+version = "0.3.0"
+source = "git+https://gitlab.com/kyber/deps/vlc-rs.git?rev=7cbfc51313b4bb3ab07be51505b7054e4e2c366b#7cbfc51313b4bb3ab07be51505b7054e4e2c366b"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "waitgroup"

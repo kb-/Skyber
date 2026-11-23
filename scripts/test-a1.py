@@ -32,7 +32,8 @@ def available_port() -> int:
 
 def await_marker(marker: Path, peer: subprocess.Popen[bytes], deadline: float) -> None:
     while not marker.exists():
-        require(peer.poll() is None, f"peer exited before writing {marker.name}")
+        require(peer.poll() is None,
+                f"peer exited before writing {marker.name} (exit={peer.returncode})")
         require(time.monotonic() < deadline, f"deadline waiting for {marker.name}")
         time.sleep(0.025)
 
@@ -376,6 +377,8 @@ def run_case(
     audio_output: int | str | None = None,
     sustained: bool = False,
     upstream_avconv_frames: int | None = None,
+    upstream_vlc_video: bool = False,
+    upstream_avconv_camera: bool = False,
 ) -> None:
     output.mkdir()
     with tempfile.TemporaryDirectory(prefix="skyber-a1-") as tmp, ExitStack() as cleanup:
@@ -428,8 +431,13 @@ def run_case(
                 config["capture"] = capture
             if upstream_avconv_frames is not None and role == "listener":
                 config["upstream_avconv_frames"] = upstream_avconv_frames
+            if upstream_avconv_camera and role == "listener":
+                config["upstream_avconv_camera"] = True
             if upstream_avconv_frames is not None and role == "initiator" and not playback:
                 config["upstream_avconv_decode"] = True
+            if upstream_vlc_video and role == "initiator":
+                config["upstream_vlc_video"] = True
+                config["playback_drain_timeout_ms"] = 12000
             if role == "initiator" and failure == "auth":
                 config["secret"] = secrets.token_hex(24)
             if role == "initiator" and failure == "certificate":
@@ -439,11 +447,21 @@ def run_case(
             (work / "peer.json").write_text(json.dumps(config), encoding="utf-8")
             stdout = cleanup.enter_context((output / f"{role}.stdout").open("wb"))
             stderr = cleanup.enter_context((output / f"{role}.stderr").open("wb"))
+            environment = None
+            if upstream_vlc_video:
+                rootfs = Path("build/kyber-rootfs").resolve(strict=True)
+                environment = os.environ.copy()
+                environment["PATH"] = os.pathsep.join(
+                    [str(rootfs / "bin"), str(rootfs / "lib"), environment.get("PATH", "")]
+                )
+                environment["VLC_PLUGIN_PATH"] = str(rootfs / "lib/vlc/plugins")
+                environment["KYBER_VLC_VERBOSE"] = "1"
             peer = subprocess.Popen(
                 [str(peer_exe), *(["--capture"] if live else []),
                  *(["--playback"] if play else []), str(work)],
                 stdout=stdout,
                 stderr=stderr,
+                env=environment,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             peers[role] = peer
@@ -455,7 +473,11 @@ def run_case(
             await_marker(listener / "microphone.receiving", peers["listener"], time.monotonic() + 6)
             stop_process(peers["initiator"])
         timeout_seconds = (
-            duration / 1000 + 85 if capture is not None else 35 if playback else 20
+            duration / 1000 + 85
+            if capture is not None
+            else 35
+            if playback or upstream_vlc_video
+            else 20
         )
         resources = monitor_processes(peers, timeout_seconds)
         (output / "resource-samples.json").write_text(json.dumps({
@@ -496,7 +518,9 @@ def run_case(
         if failure is None and capture is None:
             for role in ROLES:
                 verify_transport(read_result(output, role))
-            verify_media(output, profile, direction, screen_stop is not None, lan=sys.platform != "win32")
+        if not upstream_vlc_video:
+            verify_media(output, profile, direction, screen_stop is not None,
+                         lan=sys.platform != "win32")
         if failure is None and playback:
             for row in read_result(output, "initiator")["tracks"]:
                 if not row["received_packets"]:
@@ -567,6 +591,10 @@ def main() -> None:
     parser.add_argument("--audio-only", action="store_true")
     parser.add_argument("--upstream-avconv-frames", type=int,
                         help="run the synthetic Kyber avconv video through Kymux instead of the full suite")
+    parser.add_argument("--upstream-vlc-presentation", action="store_true",
+                        help="present synthetic Kymux video in Kyber's pinned VLC player")
+    parser.add_argument("--upstream-avconv-camera", action="store_true",
+                        help="capture a Windows webcam through Kyber avconv, Kymux and VLC")
     parser.add_argument("--playback", action="store_true",
                         help="show the received test video using the existing A1 presentation helper")
     args = parser.parse_args()
@@ -575,7 +603,43 @@ def main() -> None:
     output = args.output / stamp
     output.mkdir(parents=True)
     print(f"Gate A1 results directory {output}", flush=True)
-    if args.upstream_avconv_frames is not None:
+    if args.upstream_avconv_camera:
+        require(args.upstream_vlc_presentation,
+                "--upstream-avconv-camera requires --upstream-vlc-presentation")
+        case = output / "upstream-avconv-camera"
+        run_case(peer_exe, case, available_port(), "av", "listener", duration=10_000,
+                 upstream_vlc_video=True, upstream_avconv_camera=True)
+        sender = read_result(case, "listener")
+        receiver = read_result(case, "initiator")
+        camera_sent = next(row for row in sender["tracks"] if row["track"] == "camera")
+        camera_player = next(row for row in receiver["tracks"] if row["track"] == "camera")
+        metrics = camera_player.get("upstream_vlc_metrics", {})
+        require(camera_sent["sent_packets"] > 0,
+                "webcam capture produced no Kyber avconv packets")
+        require(metrics.get("decoded", 0) > 0 and metrics.get("displayed", 0) > 0,
+                "Kyber VLC did not decode and display webcam frames")
+        print(f"Kyber VLC displayed {metrics['displayed']} of {camera_sent['sent_packets']} webcam frames",
+              flush=True)
+    elif args.upstream_vlc_presentation:
+        require(args.upstream_avconv_frames is not None,
+                "--upstream-vlc-presentation requires --upstream-avconv-frames")
+        frames = args.upstream_avconv_frames
+        require(1 <= frames <= 1000, "upstream VLC presentation frame count must be 1..1000")
+        case = output / "upstream-vlc-presentation"
+        run_case(peer_exe, case, available_port(), "av", "listener", duration=10_000,
+                 upstream_avconv_frames=frames, upstream_vlc_video=True)
+        sender = read_result(case, "listener")
+        receiver = read_result(case, "initiator")
+        camera_sent = next(row for row in sender["tracks"] if row["track"] == "camera")
+        camera_player = next(row for row in receiver["tracks"] if row["track"] == "camera")
+        metrics = camera_player.get("upstream_vlc_metrics", {})
+        require(camera_sent["sent_packets"] == frames,
+                "synthetic camera source did not send the requested packet count")
+        require(metrics.get("decoded", 0) > 0 and metrics.get("displayed", 0) > 0,
+                "Kyber VLC did not decode and display synthetic video frames")
+        print(f"Kyber VLC presented {metrics['displayed']} of {frames} synthetic frames",
+              flush=True)
+    elif args.upstream_avconv_frames is not None:
         require(1 <= args.upstream_avconv_frames <= 1000,
                 "upstream avconv Kymux test frame count must be 1..1000")
         run_case(peer_exe, output / "upstream-avconv-video", available_port(),
@@ -590,6 +654,8 @@ def main() -> None:
                     "Kymux camera packets were not decoded by the pinned Kyber avconv graph")
     else:
         require(not args.playback, "--playback requires --upstream-avconv-frames")
+        require(not args.upstream_vlc_presentation,
+                "--upstream-vlc-presentation requires --upstream-avconv-frames")
         run_suite(peer_exe, output, args.audio_only)
 
 

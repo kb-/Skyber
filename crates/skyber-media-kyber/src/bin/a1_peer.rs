@@ -13,6 +13,8 @@ use skyber_media_kyber::{
     native::{CaptureFrame, Decoder, Encoder, MAX_CONFIG, MAX_PACKET},
     transport::{self, Inbound, LanAddress, Outbound, Role},
 };
+#[cfg(all(feature = "upstream-vlc-player", windows))]
+mod upstream_vlc;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinSet,
@@ -87,6 +89,10 @@ struct Settings {
     upstream_avconv_frames: Option<usize>,
     #[serde(default)]
     upstream_avconv_decode: bool,
+    #[serde(default)]
+    upstream_avconv_camera: bool,
+    #[serde(default)]
+    upstream_vlc_video: bool,
     audio_output: Option<DeviceSelector>,
 }
 
@@ -116,12 +122,21 @@ impl DeviceSelector {
 enum Input {
     Synthetic,
     UpstreamAvconvSynthetic(usize),
+    UpstreamAvconvCamera(u32),
     Device(DeviceSelector),
     ScreenPicker,
 }
 
 impl Settings {
     fn input(&self, track: Track) -> Input {
+        if track == Track::Camera && self.upstream_avconv_camera {
+            if let Some(DeviceSelector::Windows(index)) =
+                self.capture.as_ref().map(|cap| &cap.camera)
+            {
+                return Input::UpstreamAvconvCamera(*index);
+            }
+            return Input::UpstreamAvconvCamera(0);
+        }
         if track == Track::Camera
             && let Some(frames) = self.upstream_avconv_frames
         {
@@ -179,6 +194,14 @@ impl Settings {
             );
         }
         ensure!(
+            !config.upstream_avconv_camera
+                || (cfg!(windows)
+                    && !matches!(config.profile, Profile::Audio)
+                    && config.direction.sends(config.role)
+                    && config.capture.is_none()),
+            "upstream avconv camera input requires a Windows video sender without other live capture"
+        );
+        ensure!(
             !config.upstream_avconv_decode
                 || (cfg!(windows)
                     && !matches!(config.profile, Profile::Audio)
@@ -187,6 +210,18 @@ impl Settings {
                         Role::Initiator => Role::Listener,
                     })),
             "upstream avconv decoding requires a Windows peer receiving video"
+        );
+        ensure!(
+            !config.upstream_vlc_video
+                || (cfg!(windows)
+                    && !matches!(config.profile, Profile::Audio)
+                    && config.direction.sends(match config.role {
+                        Role::Listener => Role::Initiator,
+                        Role::Initiator => Role::Listener,
+                    })
+                    && config.upstream_avconv_frames.is_none()
+                    && config.capture.is_none()),
+            "upstream VLC presentation requires a Windows video receiver"
         );
         if let Some(capture) = &config.capture {
             ensure!(
@@ -714,6 +749,9 @@ async fn capture_frames(
         Input::UpstreamAvconvSynthetic(_) => {
             anyhow::bail!("upstream avconv input uses its dedicated publisher")
         }
+        Input::UpstreamAvconvCamera(_) => {
+            anyhow::bail!("upstream avconv camera input uses its dedicated publisher")
+        }
     }
     let mut child = command
         .stdin(Stdio::null())
@@ -775,7 +813,24 @@ async fn publish(
 ) -> Result<Observed> {
     let input = match input {
         Input::UpstreamAvconvSynthetic(frames) => {
-            return publish_upstream_avconv((track, endpoint), frames, origin).await;
+            return publish_upstream_avconv(
+                (track, endpoint),
+                Some(frames),
+                None,
+                duration_ms,
+                origin,
+            )
+            .await;
+        }
+        Input::UpstreamAvconvCamera(index) => {
+            return publish_upstream_avconv(
+                (track, endpoint),
+                None,
+                Some(index),
+                duration_ms,
+                origin,
+            )
+            .await;
         }
         input => input,
     };
@@ -838,7 +893,9 @@ async fn publish(
 
 async fn publish_upstream_avconv(
     (track, endpoint): Outbound,
-    frames: usize,
+    frames: Option<usize>,
+    camera_device: Option<u32>,
+    duration_ms: u64,
     origin: Instant,
 ) -> Result<Observed> {
     use std::process::Stdio;
@@ -853,10 +910,17 @@ async fn publish_upstream_avconv(
         "upstream avconv probe is currently built for Windows only"
     );
     let executable = std::env::current_exe()?.with_file_name("skyber-avconv-frame-probe.exe");
-    let frame_count = frames.to_string();
-    let mut child = Command::new(executable)
-        .args(["--emit", "--synthetic", frame_count.as_str()])
-        .stdin(Stdio::null())
+    let mut avconv = Command::new(executable);
+    avconv.arg("--emit");
+    if let Some(frames) = frames {
+        avconv.args(["--synthetic", &frames.to_string()]);
+    }
+    let mut child = avconv
+        .stdin(if camera_device.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -869,6 +933,42 @@ async fn publish_upstream_avconv(
         stderr.read_to_end(&mut output).await?;
         Ok::<_, std::io::Error>(output)
     });
+    let camera_feed = if let Some(index) = camera_device {
+        let capture = std::env::current_exe()?.with_file_name("skyber-windows-capture.exe");
+        let mut capture = Command::new(capture)
+            .args([
+                "--stream",
+                "camera",
+                &index.to_string(),
+                &duration_ms.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("start Windows camera capture helper")?;
+        let mut capture_stdout = capture.stdout.take().context("missing camera frame pipe")?;
+        let mut capture_stderr = capture.stderr.take().context("missing camera log pipe")?;
+        let mut avconv_stdin = child.stdin.take().context("missing avconv input pipe")?;
+        Some(tokio::spawn(async move {
+            let copy = tokio::io::copy(&mut capture_stdout, &mut avconv_stdin).await;
+            drop(avconv_stdin);
+            let capture_status = capture.wait().await?;
+            let mut diagnostics = Vec::new();
+            capture_stderr.read_to_end(&mut diagnostics).await?;
+            if !diagnostics.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&diagnostics));
+            }
+            copy?;
+            anyhow::ensure!(
+                capture_status.success(),
+                "camera capture helper failed with {capture_status}"
+            );
+            Ok::<(), anyhow::Error>(())
+        }))
+    } else {
+        None
+    };
 
     let mut magic = [0; 8];
     stdout
@@ -880,7 +980,7 @@ async fn publish_upstream_avconv(
     let mut codec_config_received = false;
     let mut sent_packets = 0_u32;
     let mut last_pts_us = 0_u64;
-    let mut timings = Vec::with_capacity(frames);
+    let mut timings = Vec::with_capacity(frames.unwrap_or(1500));
 
     loop {
         let record_type = match stdout.read_u8().await {
@@ -942,7 +1042,9 @@ async fn publish_upstream_avconv(
                     "avconv media preceded codec configuration"
                 );
                 ensure!(
-                    sent_packets < frames as u32 && pts_us <= (frames as u64 * 1_000_000 / 15) + 1,
+                    frames.is_none_or(|count| {
+                        sent_packets < count as u32 && pts_us <= (count as u64 * 1_000_000 / 15) + 1
+                    }),
                     "avconv emitted more frames or a timestamp beyond the requested source"
                 );
                 ensure!(pts_us > last_pts_us, "avconv timestamps are not increasing");
@@ -966,9 +1068,12 @@ async fn publish_upstream_avconv(
     }
 
     ensure!(
-        codec_config_received && sent_packets == frames as u32,
+        codec_config_received && frames.is_none_or(|count| sent_packets == count as u32),
         "avconv did not emit the requested configured video frame count"
     );
+    if let Some(camera_feed) = camera_feed {
+        camera_feed.await.context("join camera capture feed")??;
+    }
     let exit = child.wait().await.context("wait for avconv probe")?;
     let diagnostic = stderr_task.await.context("join avconv log reader")??;
     eprint!("{}", String::from_utf8_lossy(&diagnostic));
@@ -985,6 +1090,14 @@ async fn publish_upstream_avconv(
 }
 
 #[derive(Default, Serialize)]
+struct UpstreamVlcMetrics {
+    received: u32,
+    decoded: u32,
+    displayed: u32,
+    stop_completed: bool,
+}
+
+#[derive(Default, Serialize)]
 struct Observed {
     track: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -993,6 +1106,8 @@ struct Observed {
     decoder_backend: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     decoded_frame_checksum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_vlc_metrics: Option<UpstreamVlcMetrics>,
     sent_packets: u32,
     received_packets: usize,
     decoded_frames: u32,
@@ -1364,6 +1479,8 @@ struct SubscribeOptions {
     max_received_packets: usize,
     remote_screen_ready: Option<watch::Sender<bool>>,
     upstream_avconv_decode: bool,
+    upstream_vlc_video: bool,
+    duration_ms: u64,
 }
 
 async fn subscribe((track, endpoint): Inbound, options: SubscribeOptions) -> Result<Observed> {
@@ -1375,7 +1492,25 @@ async fn subscribe((track, endpoint): Inbound, options: SubscribeOptions) -> Res
         max_received_packets,
         remote_screen_ready,
         upstream_avconv_decode,
+        upstream_vlc_video,
+        duration_ms,
     } = options;
+    #[cfg(all(feature = "upstream-vlc-player", windows))]
+    if upstream_vlc_video && track == Track::Camera {
+        let metrics = upstream_vlc::present(endpoint, &progress, duration_ms).await?;
+        return Ok(Observed {
+            track: track.label(),
+            decoder_backend: Some("kyvlcplayer-vlc"),
+            decoded_frames: metrics.decoded,
+            upstream_vlc_metrics: Some(metrics),
+            ..Observed::default()
+        });
+    }
+    #[cfg(not(all(feature = "upstream-vlc-player", windows)))]
+    ensure!(
+        !upstream_vlc_video,
+        "upstream VLC presentation is unavailable in this build"
+    );
     let mut protocol = endpoint.ready().await?;
     let Some(types::AVPacket::Codec(params)) = protocol.recv().await? else {
         anyhow::bail!("missing codec parameters");
@@ -1473,8 +1608,27 @@ async fn subscribe((track, endpoint): Inbound, options: SubscribeOptions) -> Res
     Ok(observed)
 }
 
-async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<()> {
+async fn run(
+    directory: &Path,
+    lan: bool,
+    live: bool,
+    playback: bool,
+    upstream_vlc: bool,
+) -> Result<()> {
     let config = Settings::load(directory)?;
+    let upstream_vlc_video = config.upstream_vlc_video || upstream_vlc;
+    ensure!(
+        !upstream_vlc_video
+            || (cfg!(windows)
+                && !matches!(config.profile, Profile::Audio)
+                && config.direction.sends(match config.role {
+                    Role::Listener => Role::Initiator,
+                    Role::Initiator => Role::Listener,
+                })
+                && config.upstream_avconv_frames.is_none()
+                && config.capture.is_none()),
+        "upstream VLC presentation requires a Windows receiver with synthetic video input"
+    );
     ensure!(
         live == config.capture.is_some(),
         "live device input requires --capture and device settings"
@@ -1553,11 +1707,12 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
         .await
         .context("Kyber track registration timed out")??;
 
-        let drain_timeout = if playback || config.playback_drain_timeout_ms > 0 {
-            Duration::from_millis(config.playback_drain_timeout_ms).max(PLAYBACK_DRAIN_TIMEOUT)
-        } else {
-            SETUP_TIMEOUT
-        };
+        let drain_timeout =
+            if playback || upstream_vlc_video || config.playback_drain_timeout_ms > 0 {
+                Duration::from_millis(config.playback_drain_timeout_ms).max(PLAYBACK_DRAIN_TIMEOUT)
+            } else {
+                SETUP_TIMEOUT
+            };
         let duration =
             Duration::from_millis(config.duration_ms + config.capture_wait_ms) + drain_timeout;
         let origin = Instant::now();
@@ -1623,6 +1778,8 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
                             max_received_packets,
                             remote_screen_ready: remote_ready,
                             upstream_avconv_decode,
+                            upstream_vlc_video: upstream_vlc_video && track == Track::Camera,
+                            duration_ms: config.duration_ms,
                         },
                     )
                     .await
@@ -1679,11 +1836,12 @@ async fn main() -> Result<()> {
     let lan = args.next_if(|arg| arg == "--lan").is_some();
     let live = args.next_if(|arg| arg == "--capture").is_some();
     let playback = args.next_if(|arg| arg == "--playback").is_some();
+    let upstream_vlc = args.next_if(|arg| arg == "--upstream-vlc-video").is_some();
     let directory = args
         .next()
-        .context("usage: skyber-a1-peer [--lan] [--capture] [--playback] RUN_DIRECTORY")?;
+        .context("usage: skyber-a1-peer [--lan] [--capture] [--playback] [--upstream-vlc-video] RUN_DIRECTORY")?;
     ensure!(args.next().is_none(), "unexpected peer arguments");
-    run(&PathBuf::from(directory), lan, live, playback).await
+    run(&PathBuf::from(directory), lan, live, playback, upstream_vlc).await
 }
 
 #[cfg(test)]
