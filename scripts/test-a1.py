@@ -221,6 +221,19 @@ def verify_timing(row: dict) -> None:
                     "published timing boundaries are out of order")
     if row["received_packets"]:
         require(len(samples) == row["received_packets"], "received timing sample count changed")
+        if row.get("decoder_backend") == "kyber-avconv-h264":
+            require(summary["decode_us"]["samples"] == 0,
+                    "upstream decoder path must not report unmeasured per-packet decode time")
+            require(all(isinstance(sample.get(name), int) for sample in samples
+                        for name in ("packet_id_us", "transport_receive_us")),
+                    "upstream decoded packet is missing receive timing")
+            require(all(left["packet_id_us"] < right["packet_id_us"]
+                        for left, right in zip(samples, samples[1:])),
+                    "upstream received video PTS values are not increasing")
+            require(all(left["transport_receive_us"] <= right["transport_receive_us"]
+                        for left, right in zip(samples, samples[1:])),
+                    "upstream packet receive timestamps are not increasing")
+            return
         require(summary["decode_us"]["samples"] == row["received_packets"],
                 "decoded stage sample count changed")
         require(summary["playback_queue_depth_max"] <= 2,
@@ -415,6 +428,8 @@ def run_case(
                 config["capture"] = capture
             if upstream_avconv_frames is not None and role == "listener":
                 config["upstream_avconv_frames"] = upstream_avconv_frames
+            if upstream_avconv_frames is not None and role == "initiator" and not playback:
+                config["upstream_avconv_decode"] = True
             if role == "initiator" and failure == "auth":
                 config["secret"] = secrets.token_hex(24)
             if role == "initiator" and failure == "certificate":
@@ -561,12 +576,18 @@ def main() -> None:
     output.mkdir(parents=True)
     print(f"Gate A1 results directory {output}", flush=True)
     if args.upstream_avconv_frames is not None:
-        require(1 <= args.upstream_avconv_frames <= 9000,
-                "upstream avconv frame count must be 1..9000")
+        require(1 <= args.upstream_avconv_frames <= 1000,
+                "upstream avconv Kymux test frame count must be 1..1000")
         run_case(peer_exe, output / "upstream-avconv-video", available_port(),
                  "av", "listener", duration=10_000, playback=args.playback,
                  upstream_avconv_frames=args.upstream_avconv_frames)
         verify_media(output / "upstream-avconv-video", "av", "listener", False)
+        receiver = read_result(output / "upstream-avconv-video", "initiator")
+        camera = next(row for row in receiver["tracks"] if row["track"] == "camera")
+        if not args.playback:
+            require(camera.get("decoder_backend") == "kyber-avconv-h264"
+                    and camera["decoded_frames"] == args.upstream_avconv_frames,
+                    "Kymux camera packets were not decoded by the pinned Kyber avconv graph")
     else:
         require(not args.playback, "--playback requires --upstream-avconv-frames")
         run_suite(peer_exe, output, args.audio_only)

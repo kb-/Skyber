@@ -85,6 +85,8 @@ struct Settings {
     playback_drain_timeout_ms: u64,
     #[serde(default)]
     upstream_avconv_frames: Option<usize>,
+    #[serde(default)]
+    upstream_avconv_decode: bool,
     audio_output: Option<DeviceSelector>,
 }
 
@@ -169,13 +171,23 @@ impl Settings {
         );
         if let Some(frames) = config.upstream_avconv_frames {
             ensure!(
-                (1..=9000).contains(&frames)
+                (1..=MAX_RECEIVED_PACKETS).contains(&frames)
                     && !matches!(config.profile, Profile::Audio)
                     && config.direction.sends(config.role)
                     && config.capture.is_none(),
-                "upstream avconv input requires a sending video peer, 1..=9000 frames and no live capture"
+                "upstream avconv input requires a sending video peer, 1..=1000 frames and no live capture"
             );
         }
+        ensure!(
+            !config.upstream_avconv_decode
+                || (cfg!(windows)
+                    && !matches!(config.profile, Profile::Audio)
+                    && config.direction.sends(match config.role {
+                        Role::Listener => Role::Initiator,
+                        Role::Initiator => Role::Listener,
+                    })),
+            "upstream avconv decoding requires a Windows peer receiving video"
+        );
         if let Some(capture) = &config.capture {
             ensure!(
                 capture.microphone.matches_platform()
@@ -975,6 +987,10 @@ struct Observed {
     track: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     encoder_backend: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decoder_backend: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decoded_frame_checksum: Option<u64>,
     sent_packets: u32,
     received_packets: usize,
     decoded_frames: u32,
@@ -1225,15 +1241,139 @@ fn decode_track(
     Ok(observed)
 }
 
-async fn subscribe(
-    (track, endpoint): Inbound,
+#[derive(Deserialize)]
+struct UpstreamDecodeSummary {
+    decoder_backend: String,
+    packets: usize,
+    decoded_frames: u32,
+    last_pts: u64,
+    frame_checksum: u64,
+}
+
+fn write_avconv_record_header(
+    output: &mut impl std::io::Write,
+    record_type: u8,
+    pts_us: u64,
+    is_key: bool,
+    size: usize,
+) -> Result<()> {
+    ensure!(
+        size > 0 && size <= u32::MAX as usize,
+        "invalid avconv record size"
+    );
+    output.write_all(&[record_type])?;
+    output.write_all(&pts_us.to_le_bytes())?;
+    output.write_all(&[u8::from(is_key)])?;
+    output.write_all(&(size as u32).to_le_bytes())?;
+    Ok(())
+}
+
+fn decode_track_upstream_avconv(
+    track: Track,
+    config: Bytes,
+    mut rx: mpsc::Receiver<ReceivedPacket>,
+) -> Result<Observed> {
+    use std::{io::Write, process::Stdio};
+
+    ensure!(
+        track == Track::Camera,
+        "upstream avconv proof only supports video"
+    );
+    ensure!(
+        !config.is_empty() && config.len() <= MAX_CONFIG,
+        "invalid H.264 config size"
+    );
+    let executable =
+        std::env::current_exe()?.with_file_name("skyber-avconv-packet-decode-probe.exe");
+    let mut child = std::process::Command::new(executable)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("start pinned Kyber avconv decoder probe")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("missing avconv decoder input pipe")?;
+    stdin.write_all(b"SKYAVC01")?;
+    write_avconv_record_header(&mut stdin, 1, 0, false, config.len())?;
+    stdin.write_all(&config)?;
+
+    let mut observed = Observed {
+        track: track.label(),
+        decoder_backend: Some("kyber-avconv-h264"),
+        ..Observed::default()
+    };
+    let mut last_pts = 0_u64;
+    while let Some(ReceivedPacket { packet, timing }) = rx.blocking_recv() {
+        ensure!(
+            !packet.header.is_config
+                && !packet.payload.is_empty()
+                && packet.payload.len() <= MAX_PACKET
+                && packet.header.pts > last_pts,
+            "invalid upstream avconv video packet"
+        );
+        ensure!(
+            timing.packet_id_us == packet.header.pts,
+            "packet timing identity mismatch"
+        );
+        write_avconv_record_header(
+            &mut stdin,
+            2,
+            packet.header.pts,
+            packet.header.is_key,
+            packet.payload.len(),
+        )?;
+        stdin.write_all(&packet.payload)?;
+        observed.timings.push(timing);
+        observed.received_packets += 1;
+        last_pts = packet.header.pts;
+    }
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .context("wait for Kyber avconv decoder probe")?;
+    ensure!(
+        output.status.success(),
+        "Kyber avconv decoder failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: UpstreamDecodeSummary =
+        serde_json::from_slice(&output.stdout).context("parse Kyber avconv decoder summary")?;
+    ensure!(
+        summary.decoder_backend == "kyber-avconv-h264"
+            && summary.packets == observed.received_packets
+            && summary.decoded_frames > 0
+            && summary.last_pts < u64::from(summary.decoded_frames) + 30
+            && summary.frame_checksum != 0,
+        "Kyber avconv decoder did not return valid frames"
+    );
+    observed.decoded_frames = summary.decoded_frames;
+    observed.decoded_frame_checksum = Some(summary.frame_checksum);
+    observed.timing_summary = timing_summary(&observed.timings);
+    Ok(observed)
+}
+
+struct SubscribeOptions {
     progress: PathBuf,
     origin: Instant,
     playback: bool,
     audio_output: Option<DeviceSelector>,
     max_received_packets: usize,
     remote_screen_ready: Option<watch::Sender<bool>>,
-) -> Result<Observed> {
+    upstream_avconv_decode: bool,
+}
+
+async fn subscribe((track, endpoint): Inbound, options: SubscribeOptions) -> Result<Observed> {
+    let SubscribeOptions {
+        progress,
+        origin,
+        playback,
+        audio_output,
+        max_received_packets,
+        remote_screen_ready,
+        upstream_avconv_decode,
+    } = options;
     let mut protocol = endpoint.ready().await?;
     let Some(types::AVPacket::Codec(params)) = protocol.recv().await? else {
         anyhow::bail!("missing codec parameters");
@@ -1253,7 +1393,11 @@ async fn subscribe(
     let (frames, output) = mpsc::channel(2);
     let frames = playback.then_some(frames);
     let worker = tokio::task::spawn_blocking(move || {
-        decode_track(track, config.payload, rx, origin, frames)
+        if upstream_avconv_decode {
+            decode_track_upstream_avconv(track, config.payload, rx)
+        } else {
+            decode_track(track, config.payload, rx, origin, frames)
+        }
     });
     let receive = async move {
         let mut received = 0;
@@ -1464,15 +1608,20 @@ async fn run(directory: &Path, lan: bool, live: bool, playback: bool) -> Result<
                 } else {
                     MAX_RECEIVED_PACKETS
                 };
+                let upstream_avconv_decode =
+                    config.upstream_avconv_decode && track == Track::Camera;
                 tasks.spawn(async move {
                     subscribe(
                         endpoint,
-                        progress,
-                        origin,
-                        playback,
-                        audio_output,
-                        max_received_packets,
-                        remote_ready,
+                        SubscribeOptions {
+                            progress,
+                            origin,
+                            playback,
+                            audio_output,
+                            max_received_packets,
+                            remote_screen_ready: remote_ready,
+                            upstream_avconv_decode,
+                        },
                     )
                     .await
                     .with_context(|| format!("subscribing to {}", track.label()))
