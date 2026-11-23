@@ -946,6 +946,8 @@ async fn publish_upstream_avconv(
                     "avconv emitted more frames or a timestamp beyond the requested source"
                 );
                 ensure!(pts_us > last_pts_us, "avconv timestamps are not increasing");
+                tokio::time::sleep(Duration::from_micros(pts_us).saturating_sub(origin.elapsed()))
+                    .await;
                 let mut timing = TimingSample {
                     packet_id_us: pts_us,
                     ..TimingSample::default()
